@@ -1,17 +1,9 @@
 package server
 
-import (
-	"testing"
-	"time"
-)
-
-// fakeClock returns a now-function bound to a *time.Time you can advance.
-func fakeClock(t *time.Time) func() time.Time {
-	return func() time.Time { return *t }
-}
+import "testing"
 
 func TestSessions_AcquireCreatesNewSession(t *testing.T) {
-	s := NewSessions(time.Hour, 10)
+	s := NewSessions(10)
 	sess := s.Acquire("a")
 	if sess == nil {
 		t.Fatal("Acquire returned nil")
@@ -25,7 +17,7 @@ func TestSessions_AcquireCreatesNewSession(t *testing.T) {
 }
 
 func TestSessions_AcquireReturnsSameSessionByID(t *testing.T) {
-	s := NewSessions(time.Hour, 10)
+	s := NewSessions(10)
 	first := s.Acquire("a")
 	second := s.Acquire("a")
 	if first != second {
@@ -34,7 +26,7 @@ func TestSessions_AcquireReturnsSameSessionByID(t *testing.T) {
 }
 
 func TestSessions_DifferentIDsAreIsolated(t *testing.T) {
-	s := NewSessions(time.Hour, 10)
+	s := NewSessions(10)
 	a := s.Acquire("a")
 	b := s.Acquire("b")
 	if a == b {
@@ -45,76 +37,48 @@ func TestSessions_DifferentIDsAreIsolated(t *testing.T) {
 	}
 }
 
-func TestSessions_ExpiredSessionReplaced(t *testing.T) {
-	now := time.Unix(0, 0)
-	s := NewSessions(time.Minute, 10)
-	s.now = fakeClock(&now)
-
+func TestSessions_NoTimeBasedExpiration(t *testing.T) {
+	// Sessions live for the life of the process; only the cap evicts them.
+	// This guards against anyone reintroducing TTL logic.
+	s := NewSessions(10)
 	first := s.Acquire("a")
-
-	now = now.Add(2 * time.Minute) // past TTL
-	second := s.Acquire("a")
-
-	if first == second {
-		t.Error("expected expired session to be replaced with a fresh one")
+	for range 1000 {
+		// Many other operations should not displace "a" while we're under cap.
+		s.Acquire("a")
+	}
+	if s.Acquire("a") != first {
+		t.Error("session was replaced despite no eviction reason")
 	}
 }
 
-func TestSessions_AccessRefreshesTTL(t *testing.T) {
-	now := time.Unix(0, 0)
-	s := NewSessions(time.Minute, 10)
-	s.now = fakeClock(&now)
-
-	first := s.Acquire("a")
-
-	now = now.Add(30 * time.Second) // within TTL
-	again := s.Acquire("a")
-	if again != first {
-		t.Fatal("session replaced before TTL elapsed")
-	}
-
-	now = now.Add(45 * time.Second) // 75s since first, 45s since refresh — still fresh
-	stillSame := s.Acquire("a")
-	if stillSame != first {
-		t.Error("access did not refresh lastAccess")
-	}
-}
-
-func TestSessions_MaxSizeEvictsOldest(t *testing.T) {
-	now := time.Unix(0, 0)
-	s := NewSessions(time.Hour, 2)
-	s.now = fakeClock(&now)
+func TestSessions_LRUEvictsLeastRecentlyUsed(t *testing.T) {
+	s := NewSessions(2)
 
 	s.Acquire("a")
-	now = now.Add(time.Second)
 	s.Acquire("b")
-	now = now.Add(time.Second)
-	// Inserting a third should evict "a" (oldest lastAccess).
-	s.Acquire("c")
+	s.Acquire("a") // refresh "a" — now "b" is the LRU
+	s.Acquire("c") // should evict "b"
 
 	if s.Len() != 2 {
 		t.Fatalf("Len = %d, want 2", s.Len())
 	}
-	if _, ok := s.byID["a"]; ok {
-		t.Error("expected 'a' to be evicted")
+	if _, ok := s.byID["b"]; ok {
+		t.Error("expected 'b' to be evicted (least recently used)")
 	}
-	if _, ok := s.byID["b"]; !ok {
-		t.Error("expected 'b' to be retained")
+	if _, ok := s.byID["a"]; !ok {
+		t.Error("expected 'a' to be retained (recently refreshed)")
 	}
 	if _, ok := s.byID["c"]; !ok {
 		t.Error("expected 'c' to be present")
 	}
 }
 
-func TestSessions_ZeroTTLDisablesExpiration(t *testing.T) {
-	now := time.Unix(0, 0)
-	s := NewSessions(0, 10)
-	s.now = fakeClock(&now)
-
-	first := s.Acquire("a")
-	now = now.Add(1000 * time.Hour)
-	again := s.Acquire("a")
-	if first != again {
-		t.Error("zero TTL should disable expiration; session was replaced")
+func TestSessions_ZeroMaxDisablesCap(t *testing.T) {
+	s := NewSessions(0)
+	for i := range 50 {
+		s.Acquire(string(rune('a' + i)))
+	}
+	if s.Len() != 50 {
+		t.Errorf("Len = %d, want 50 (cap disabled)", s.Len())
 	}
 }

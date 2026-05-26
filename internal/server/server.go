@@ -25,7 +25,7 @@ func New(client DeepSeekClient) *Server {
 	return &Server{
 		client:       client,
 		defaultModel: deepseek.DeepSeekReasoner,
-		sessions:     NewSessions(defaultSessionTTL, defaultMaxSessions),
+		sessions:     NewSessions(defaultMaxSessions),
 	}
 }
 
