@@ -1,6 +1,6 @@
 # dpal
 
-An MCP server providing access to DeepSeek models, including R1's separate
+dpal is an MCP server providing access to DeepSeek models, including R1's separate
 reasoning channel.
 
 Sibling of [gpal](https://github.com/tobert/gpal) (Gemini) and cpal (Claude),
