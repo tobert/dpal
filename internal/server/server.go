@@ -24,6 +24,7 @@ type Server struct {
 	defaultModel string
 	sessions     *Sessions
 	tracer       trace.Tracer
+	version      string
 }
 
 func New(client DeepSeekClient) *Server {
@@ -32,6 +33,7 @@ func New(client DeepSeekClient) *Server {
 		defaultModel: deepseek.DeepSeekReasoner,
 		sessions:     NewSessions(defaultMaxSessions),
 		tracer:       otel.Tracer("dpal"),
+		version:      "unknown",
 	}
 }
 
@@ -41,6 +43,13 @@ func New(client DeepSeekClient) *Server {
 // via otelinit.Bootstrap.
 func (s *Server) WithTracer(t trace.Tracer) *Server {
 	s.tracer = t
+	return s
+}
+
+// WithVersion records the build version exposed via the dpal://info
+// resource. Returns the receiver for chaining.
+func (s *Server) WithVersion(v string) *Server {
+	s.version = v
 	return s
 }
 
@@ -220,4 +229,23 @@ func (s *Server) Register(mcpServer *mcp.Server) {
 		Name:        "consult_deepseek",
 		Description: "Send a prompt to DeepSeek in a stateful conversation keyed by session_id. Subsequent calls with the same session_id continue the conversation.",
 	}, s.Consult)
+
+	mcpServer.AddResource(&mcp.Resource{
+		URI:         infoURI,
+		Name:        "info",
+		Description: "dpal service info (version, defaults, session counts)",
+		MIMEType:    jsonMIME,
+	}, s.handleInfo)
+	mcpServer.AddResource(&mcp.Resource{
+		URI:         sessionsURI,
+		Name:        "sessions",
+		Description: "list of active dpal conversation sessions with metadata",
+		MIMEType:    jsonMIME,
+	}, s.handleSessions)
+	mcpServer.AddResourceTemplate(&mcp.ResourceTemplate{
+		URITemplate: sessionTemplate,
+		Name:        "session",
+		Description: "full transcript of one session",
+		MIMEType:    jsonMIME,
+	}, s.handleSession)
 }

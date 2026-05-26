@@ -79,7 +79,7 @@ func run(args []string, getenv func(string) string) error {
 	}()
 
 	client := deepseek.NewClient(apiKey)
-	srv := server.New(client)
+	srv := server.New(client).WithVersion(version)
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{
 		Name:    "dpal",

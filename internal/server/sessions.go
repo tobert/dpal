@@ -72,6 +72,78 @@ func (s *Sessions) Len() int {
 	return len(s.byID)
 }
 
+// SessionInfo is a snapshot of a Session's external-facing metadata.
+type SessionInfo struct {
+	ID           string `json:"id"`
+	MessageCount int    `json:"message_count"`
+	UserTurns    int    `json:"user_turns"`
+	AccessGen    uint64 `json:"access_gen"`
+}
+
+// TranscriptMessage is one entry in a session transcript, deep-copied
+// from the live session so callers can read it without locking.
+type TranscriptMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// Snapshot returns lightweight metadata for every stored session,
+// sorted by AccessGen ascending (oldest-first). Briefly locks each
+// session to read message count, so concurrent writes serialise.
+func (s *Sessions) Snapshot() []SessionInfo {
+	s.mu.Lock()
+	all := make([]*Session, 0, len(s.byID))
+	for _, sess := range s.byID {
+		all = append(all, sess)
+	}
+	s.mu.Unlock()
+
+	out := make([]SessionInfo, 0, len(all))
+	for _, sess := range all {
+		sess.mu.Lock()
+		userTurns := 0
+		for _, m := range sess.messages {
+			if m.Role == "user" {
+				userTurns++
+			}
+		}
+		out = append(out, SessionInfo{
+			ID:           sess.id,
+			MessageCount: len(sess.messages),
+			UserTurns:    userTurns,
+			AccessGen:    sess.accessN,
+		})
+		sess.mu.Unlock()
+	}
+
+	// Sort by AccessGen so output is deterministic.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j-1].AccessGen > out[j].AccessGen; j-- {
+			out[j-1], out[j] = out[j], out[j-1]
+		}
+	}
+	return out
+}
+
+// Transcript returns a deep copy of the message log for id. The second
+// return value is false if no such session exists.
+func (s *Sessions) Transcript(id string) ([]TranscriptMessage, bool) {
+	s.mu.Lock()
+	sess, ok := s.byID[id]
+	s.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	out := make([]TranscriptMessage, len(sess.messages))
+	for i, m := range sess.messages {
+		out[i] = TranscriptMessage{Role: m.Role, Content: m.Content}
+	}
+	return out, true
+}
+
 // evictOldestLocked removes the session with the smallest accessN.
 // Caller must hold s.mu.
 func (s *Sessions) evictOldestLocked() {
