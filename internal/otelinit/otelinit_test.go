@@ -17,3 +17,14 @@ func TestBootstrap_EmptyEndpointIsNoop(t *testing.T) {
 		t.Errorf("no-op shutdown returned error: %v", err)
 	}
 }
+
+func TestBootstrap_RejectsUnknownProtocol(t *testing.T) {
+	_, err := Bootstrap(context.Background(), Config{
+		Endpoint: "localhost:4318",
+		Protocol: "carrier-pigeon",
+		Insecure: true,
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown protocol")
+	}
+}

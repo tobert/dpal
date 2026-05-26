@@ -29,7 +29,8 @@ func main() {
 func run(args []string, getenv func(string) string) error {
 	fs := flag.NewFlagSet("dpal", flag.ContinueOnError)
 	apiKeyFlag := fs.String("api-key", "", "DeepSeek API key (overrides DEEPSEEK_API_KEY)")
-	otelEndpointFlag := fs.String("otel-endpoint", "", "OTLP gRPC endpoint, e.g. localhost:4317 (overrides OTEL_EXPORTER_OTLP_ENDPOINT). Empty disables OTel.")
+	otelEndpointFlag := fs.String("otel-endpoint", "", "OTLP endpoint, e.g. localhost:4317 (gRPC) or localhost:4318 (HTTP). Overrides OTEL_EXPORTER_OTLP_ENDPOINT; empty disables OTel.")
+	otelProtocolFlag := fs.String("otel-protocol", "", "OTLP transport: 'grpc' (default) or 'http/protobuf'. Overrides OTEL_EXPORTER_OTLP_PROTOCOL.")
 	otelInsecureFlag := fs.Bool("otel-insecure", true, "Send OTLP traces in plaintext (set false to require TLS)")
 	rootFlag := fs.String("root", ".", "Directory DeepSeek may inspect via list_directory/read_file/search_project. Combine with --no-explore to disable entirely.")
 	noExploreFlag := fs.Bool("no-explore", false, "Disable the exploration tools (list_directory, read_file, search_project)")
@@ -61,6 +62,10 @@ func run(args []string, getenv func(string) string) error {
 	if otelEndpoint == "" {
 		otelEndpoint = getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
 	}
+	otelProtocol := *otelProtocolFlag
+	if otelProtocol == "" {
+		otelProtocol = getenv("OTEL_EXPORTER_OTLP_PROTOCOL")
+	}
 	serviceName := getenv("OTEL_SERVICE_NAME")
 	if serviceName == "" {
 		serviceName = "dpal"
@@ -68,6 +73,7 @@ func run(args []string, getenv func(string) string) error {
 
 	shutdown, err := otelinit.Bootstrap(ctx, otelinit.Config{
 		Endpoint:    otelEndpoint,
+		Protocol:    otelProtocol,
 		ServiceName: serviceName,
 		Version:     version,
 		Insecure:    *otelInsecureFlag,

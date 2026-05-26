@@ -43,14 +43,48 @@ turn.
 ## Build
 
 ```sh
-go build ./cmd/dpal
+go install ./cmd/dpal       # installs to $GOBIN (typically ~/go/bin/dpal)
+# — or —
+go build ./cmd/dpal         # leaves ./dpal in the project dir
 ```
 
-## Run
+## Install into Claude Code
+
+Save your DeepSeek API key to `~/.deepseek-key` (one line, no trailing
+newline matters since `$(< ...)` strips it), then register dpal as a
+user-scope MCP server:
+
+```sh
+claude mcp add dpal \
+    -s user \
+    -e "DEEPSEEK_API_KEY=$(< ~/.deepseek-key)" \
+    -- ~/go/bin/dpal
+```
+
+With a local OTel collector listening on the default OTLP HTTP port
+(4318) — useful with Jaeger, SigNoz, or `otelcol --config local`:
+
+```sh
+claude mcp add dpal \
+    -s user \
+    -e "DEEPSEEK_API_KEY=$(< ~/.deepseek-key)" \
+    -- ~/go/bin/dpal \
+       --otel-endpoint localhost:4318 \
+       --otel-protocol http/protobuf
+```
+
+(`$(< ~/.deepseek-key)` is expanded by the shell at `claude mcp add`
+time, so the resolved key is stored in Claude Code's MCP config. Re-run
+the command to rotate.)
+
+Inspect or remove with `claude mcp list`, `claude mcp get dpal`, or
+`claude mcp remove dpal`.
+
+## Run standalone
 
 ```sh
 export DEEPSEEK_API_KEY=...
-./dpal
+dpal
 ```
 
 Speaks MCP over stdio.
@@ -63,13 +97,18 @@ Speaks MCP over stdio.
 | `--root` | — | `.` |
 | `--no-explore` | — | `false` |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | empty (OTel disabled) |
+| `--otel-protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` |
 | `--otel-insecure` | — | `true` |
 | `--version` | — | — |
 
 ### Tracing
 
 When `--otel-endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) is set, dpal
-exports OTLP gRPC traces with one `deepseek.chat` span per upstream call,
-carrying `gen_ai.*` semantic attributes plus DeepSeek-specific cache
-hit/miss token counts. `OTEL_SERVICE_NAME` overrides the default
-`service.name=dpal`.
+exports OTLP traces with one `deepseek.chat` span per upstream call
+plus an `explorer.tool_call` child span per tool dispatch. Spans carry
+`gen_ai.*` semantic attributes (system, operation, request/response
+model, input/output tokens) plus DeepSeek-specific
+`deepseek.usage.cache_hit_tokens` / `cache_miss_tokens`. Both gRPC
+(default, port 4317) and HTTP (`--otel-protocol http/protobuf`, port
+4318) transports are supported. `OTEL_SERVICE_NAME` overrides the
+default `service.name=dpal`.
