@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	deepseek "github.com/cohesion-org/deepseek-go"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/tobert/dpal/internal/otelinit"
 	"github.com/tobert/dpal/internal/server"
 )
 
@@ -26,6 +28,8 @@ func main() {
 func run(args []string, getenv func(string) string) error {
 	fs := flag.NewFlagSet("dpal", flag.ContinueOnError)
 	apiKeyFlag := fs.String("api-key", "", "DeepSeek API key (overrides DEEPSEEK_API_KEY)")
+	otelEndpointFlag := fs.String("otel-endpoint", "", "OTLP gRPC endpoint, e.g. localhost:4317 (overrides OTEL_EXPORTER_OTLP_ENDPOINT). Empty disables OTel.")
+	otelInsecureFlag := fs.Bool("otel-insecure", true, "Send OTLP traces in plaintext (set false to require TLS)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -44,6 +48,36 @@ func run(args []string, getenv func(string) string) error {
 		return fmt.Errorf("API key required: pass --api-key or set DEEPSEEK_API_KEY")
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	otelEndpoint := *otelEndpointFlag
+	if otelEndpoint == "" {
+		otelEndpoint = getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}
+	if otelEndpoint == "" {
+		otelEndpoint = getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+	}
+	serviceName := getenv("OTEL_SERVICE_NAME")
+	if serviceName == "" {
+		serviceName = "dpal"
+	}
+
+	shutdown, err := otelinit.Bootstrap(ctx, otelinit.Config{
+		Endpoint:    otelEndpoint,
+		ServiceName: serviceName,
+		Version:     version,
+		Insecure:    *otelInsecureFlag,
+	})
+	if err != nil {
+		return fmt.Errorf("otel init: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdown(shutdownCtx)
+	}()
+
 	client := deepseek.NewClient(apiKey)
 	srv := server.New(client)
 
@@ -52,9 +86,6 @@ func run(args []string, getenv func(string) string) error {
 		Version: version,
 	}, nil)
 	srv.Register(mcpServer)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	return mcpServer.Run(ctx, &mcp.StdioTransport{})
 }

@@ -7,6 +7,10 @@ import (
 
 	deepseek "github.com/cohesion-org/deepseek-go"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // DeepSeekClient is the subset of the deepseek-go client surface dpal uses.
@@ -19,6 +23,7 @@ type Server struct {
 	client       DeepSeekClient
 	defaultModel string
 	sessions     *Sessions
+	tracer       trace.Tracer
 }
 
 func New(client DeepSeekClient) *Server {
@@ -26,7 +31,55 @@ func New(client DeepSeekClient) *Server {
 		client:       client,
 		defaultModel: deepseek.DeepSeekReasoner,
 		sessions:     NewSessions(defaultMaxSessions),
+		tracer:       otel.Tracer("dpal"),
 	}
+}
+
+// WithTracer overrides the OTel tracer used to instrument upstream
+// calls. Returns the receiver so it can be chained off New. Primarily
+// for tests; production code should configure the global TracerProvider
+// via otelinit.Bootstrap.
+func (s *Server) WithTracer(t trace.Tracer) *Server {
+	s.tracer = t
+	return s
+}
+
+// chat is the single instrumented chokepoint for DeepSeek calls. Both
+// tools route through it so spans, attributes, and error recording are
+// guaranteed identical.
+func (s *Server) chat(
+	ctx context.Context,
+	model string,
+	messages []deepseek.ChatCompletionMessage,
+) (*deepseek.ChatCompletionResponse, error) {
+	ctx, span := s.tracer.Start(ctx, "deepseek.chat",
+		trace.WithAttributes(
+			attribute.String("gen_ai.system", "deepseek"),
+			attribute.String("gen_ai.operation.name", "chat"),
+			attribute.String("gen_ai.request.model", model),
+			attribute.Int("gen_ai.request.message_count", len(messages)),
+		),
+	)
+	defer span.End()
+
+	resp, err := s.client.CreateChatCompletion(ctx, &deepseek.ChatCompletionRequest{
+		Model:    model,
+		Messages: messages,
+	})
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		span.RecordError(err)
+		return nil, err
+	}
+
+	span.SetAttributes(
+		attribute.String("gen_ai.response.model", resp.Model),
+		attribute.Int("gen_ai.usage.input_tokens", resp.Usage.PromptTokens),
+		attribute.Int("gen_ai.usage.output_tokens", resp.Usage.CompletionTokens),
+		attribute.Int("deepseek.usage.cache_hit_tokens", resp.Usage.PromptCacheHitTokens),
+		attribute.Int("deepseek.usage.cache_miss_tokens", resp.Usage.PromptCacheMissTokens),
+	)
+	return resp, nil
 }
 
 type OneshotInput struct {
@@ -54,11 +107,8 @@ func (s *Server) ConsultOneshot(
 		model = s.defaultModel
 	}
 
-	resp, err := s.client.CreateChatCompletion(ctx, &deepseek.ChatCompletionRequest{
-		Model: model,
-		Messages: []deepseek.ChatCompletionMessage{
-			{Role: deepseek.ChatMessageRoleUser, Content: in.Prompt},
-		},
+	resp, err := s.chat(ctx, model, []deepseek.ChatCompletionMessage{
+		{Role: deepseek.ChatMessageRoleUser, Content: in.Prompt},
 	})
 	if err != nil {
 		return nil, OneshotOutput{}, fmt.Errorf("deepseek call failed: %w", err)
@@ -123,10 +173,7 @@ func (s *Server) Consult(
 		Content: in.Prompt,
 	})
 
-	resp, err := s.client.CreateChatCompletion(ctx, &deepseek.ChatCompletionRequest{
-		Model:    model,
-		Messages: sess.messages,
-	})
+	resp, err := s.chat(ctx, model, sess.messages)
 	if err != nil {
 		// Roll back the user turn we speculatively appended so a retry
 		// from the client doesn't double-send the same prompt.
