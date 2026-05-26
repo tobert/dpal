@@ -43,10 +43,13 @@ turn.
 ## Build
 
 ```sh
-go install ./cmd/dpal       # installs to $GOBIN (typically ~/go/bin/dpal)
-# — or —
-go build ./cmd/dpal         # leaves ./dpal in the project dir
+go install ./cmd/dpal
 ```
+
+This drops the binary at `$(go env GOPATH)/bin/dpal` (or `$(go env GOBIN)`
+if you've set it). Make sure that directory is on your `PATH` so the MCP
+client can spawn `dpal` by name. `go build ./cmd/dpal` is also fine for
+development; it leaves `./dpal` in the project.
 
 ## Install into Claude Code
 
@@ -59,8 +62,11 @@ Code's MCP config or in `ps` output.
 ```sh
 claude mcp add dpal \
     -s user \
-    -- ~/go/bin/dpal --api-key-file ~/.deepseek-key
+    -- dpal --api-key-file ~/.deepseek-key
 ```
+
+(If `dpal` isn't on the spawning shell's `PATH`, substitute an absolute
+path — `$(command -v dpal)` resolves it at install time.)
 
 With a local OTel collector listening on the default OTLP HTTP port
 (4318) — useful with Jaeger, SigNoz, or `otelcol --config local`:
@@ -68,11 +74,15 @@ With a local OTel collector listening on the default OTLP HTTP port
 ```sh
 claude mcp add dpal \
     -s user \
-    -- ~/go/bin/dpal \
+    -- dpal \
        --api-key-file ~/.deepseek-key \
        --otel-endpoint localhost:4318 \
        --otel-protocol http/protobuf
 ```
+
+Substitute your collector's actual address — `localhost:4317` for gRPC
+(omit `--otel-protocol`, gRPC is the default), or whatever
+`OTEL_EXPORTER_OTLP_ENDPOINT` your tooling reports.
 
 Inspect or remove with `claude mcp list`, `claude mcp get dpal`, or
 `claude mcp remove dpal`.
