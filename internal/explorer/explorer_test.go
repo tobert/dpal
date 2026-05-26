@@ -143,6 +143,35 @@ func TestReadFile_TruncatesLargeFile(t *testing.T) {
 	}
 }
 
+func TestReadFile_ExactCapBoundary(t *testing.T) {
+	// File equal to the cap: full contents returned, no truncation marker.
+	exp, dir := newTestExplorer(t)
+	exp.maxFileBytes = 10
+	writeFile(t, dir, "exact.txt", strings.Repeat("y", 10))
+	out, err := exp.ReadFile("exact.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "truncated") {
+		t.Errorf("file exactly at cap should not be marked truncated:\n%s", out)
+	}
+	if !strings.Contains(out, "10 bytes") {
+		t.Errorf("expected size header for 10-byte file:\n%s", out)
+	}
+}
+
+func TestReadFile_EmptyFile(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "empty.txt", "")
+	out, err := exp.ReadFile("empty.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "0 bytes") {
+		t.Errorf("expected 0-byte size header:\n%s", out)
+	}
+}
+
 func TestReadFile_RejectsDirectory(t *testing.T) {
 	exp, dir := newTestExplorer(t)
 	if err := os.Mkdir(filepath.Join(dir, "d"), 0o755); err != nil {

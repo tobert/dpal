@@ -7,6 +7,7 @@ package explorer
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -177,18 +178,15 @@ func (e *Explorer) ReadFile(path string) (string, error) {
 	return b.String(), nil
 }
 
-func readCapped(path string, cap int64) ([]byte, error) {
+// readCapped returns up to max bytes from path, surfacing every read
+// error io.ReadAll surfaces — partial-read failures must not be hidden.
+func readCapped(path string, max int64) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	buf := make([]byte, cap)
-	n, err := f.Read(buf)
-	if err != nil && err.Error() != "EOF" && n == 0 {
-		return nil, err
-	}
-	return buf[:n], nil
+	return io.ReadAll(io.LimitReader(f, max))
 }
 
 // SearchProject scans files under the sandbox root for lines matching
