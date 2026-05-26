@@ -13,6 +13,7 @@ import (
 	deepseek "github.com/cohesion-org/deepseek-go"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/tobert/dpal/internal/explorer"
 	"github.com/tobert/dpal/internal/otelinit"
 	"github.com/tobert/dpal/internal/server"
 )
@@ -30,6 +31,8 @@ func run(args []string, getenv func(string) string) error {
 	apiKeyFlag := fs.String("api-key", "", "DeepSeek API key (overrides DEEPSEEK_API_KEY)")
 	otelEndpointFlag := fs.String("otel-endpoint", "", "OTLP gRPC endpoint, e.g. localhost:4317 (overrides OTEL_EXPORTER_OTLP_ENDPOINT). Empty disables OTel.")
 	otelInsecureFlag := fs.Bool("otel-insecure", true, "Send OTLP traces in plaintext (set false to require TLS)")
+	rootFlag := fs.String("root", ".", "Directory DeepSeek may inspect via list_directory/read_file/search_project. Combine with --no-explore to disable entirely.")
+	noExploreFlag := fs.Bool("no-explore", false, "Disable the exploration tools (list_directory, read_file, search_project)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -80,6 +83,14 @@ func run(args []string, getenv func(string) string) error {
 
 	client := deepseek.NewClient(apiKey)
 	srv := server.New(client).WithVersion(version)
+
+	if !*noExploreFlag {
+		exp, err := explorer.New(*rootFlag)
+		if err != nil {
+			return fmt.Errorf("explorer: %w", err)
+		}
+		srv = srv.WithExplorer(exp)
+	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{
 		Name:    "dpal",

@@ -11,7 +11,11 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/tobert/dpal/internal/explorer"
 )
+
+const defaultMaxToolIterations = 10
 
 // DeepSeekClient is the subset of the deepseek-go client surface dpal uses.
 // Defined as an interface so handlers can be tested without network access.
@@ -20,21 +24,33 @@ type DeepSeekClient interface {
 }
 
 type Server struct {
-	client       DeepSeekClient
-	defaultModel string
-	sessions     *Sessions
-	tracer       trace.Tracer
-	version      string
+	client            DeepSeekClient
+	defaultModel      string
+	sessions          *Sessions
+	tracer            trace.Tracer
+	version           string
+	explorer          *explorer.Explorer
+	maxToolIterations int
 }
 
 func New(client DeepSeekClient) *Server {
 	return &Server{
-		client:       client,
-		defaultModel: deepseek.DeepSeekReasoner,
-		sessions:     NewSessions(defaultMaxSessions),
-		tracer:       otel.Tracer("dpal"),
-		version:      "unknown",
+		client:            client,
+		defaultModel:      deepseek.DeepSeekReasoner,
+		sessions:          NewSessions(defaultMaxSessions),
+		tracer:            otel.Tracer("dpal"),
+		version:           "unknown",
+		maxToolIterations: defaultMaxToolIterations,
 	}
+}
+
+// WithExplorer enables DeepSeek-driven exploration of the given
+// sandboxed directory by attaching the explorer's tool schemas to
+// every chat request and dispatching tool calls during the response
+// loop. Pass nil (the default) to disable exploration.
+func (s *Server) WithExplorer(e *explorer.Explorer) *Server {
+	s.explorer = e
+	return s
 }
 
 // WithTracer overrides the OTel tracer used to instrument upstream
@@ -53,13 +69,84 @@ func (s *Server) WithVersion(v string) *Server {
 	return s
 }
 
-// chat is the single instrumented chokepoint for DeepSeek calls. Both
-// tools route through it so spans, attributes, and error recording are
-// guaranteed identical.
+// chat orchestrates one or more DeepSeek calls, dispatching any tool
+// calls the model requests through the configured Explorer until the
+// model returns a final answer (FinishReason != "tool_calls") or the
+// loop hits maxToolIterations. The returned slice is a fresh allocation
+// containing the full message history including tool exchanges; the
+// caller's input is never mutated.
 func (s *Server) chat(
 	ctx context.Context,
 	model string,
 	messages []deepseek.ChatCompletionMessage,
+) (*deepseek.ChatCompletionResponse, []deepseek.ChatCompletionMessage, error) {
+	msgs := make([]deepseek.ChatCompletionMessage, len(messages))
+	copy(msgs, messages)
+
+	var tools []deepseek.Tool
+	if s.explorer != nil {
+		tools = s.explorer.ToolDefinitions()
+	}
+
+	maxIter := s.maxToolIterations
+	if maxIter <= 0 {
+		maxIter = 1
+	}
+
+	for iter := 0; iter < maxIter; iter++ {
+		resp, err := s.callOnce(ctx, model, msgs, tools, iter)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(resp.Choices) == 0 {
+			return nil, nil, fmt.Errorf("deepseek returned no choices")
+		}
+		choice := resp.Choices[0]
+
+		hasToolCalls := len(choice.Message.ToolCalls) > 0
+		if !hasToolCalls {
+			// Final answer. Append assistant content (no reasoning) to
+			// the durable history and return.
+			msgs = append(msgs, deepseek.ChatCompletionMessage{
+				Role:    deepseek.ChatMessageRoleAssistant,
+				Content: choice.Message.Content,
+			})
+			return resp, msgs, nil
+		}
+
+		if s.explorer == nil {
+			return nil, nil, fmt.Errorf("deepseek requested tools but no explorer is configured")
+		}
+
+		// Record the assistant turn that carries the tool calls.
+		msgs = append(msgs, deepseek.ChatCompletionMessage{
+			Role:      deepseek.ChatMessageRoleAssistant,
+			Content:   choice.Message.Content,
+			ToolCalls: choice.Message.ToolCalls,
+		})
+
+		// Dispatch each tool call and append its result.
+		for _, tc := range choice.Message.ToolCalls {
+			result := s.dispatchToolCall(ctx, tc)
+			msgs = append(msgs, deepseek.ChatCompletionMessage{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content:    result,
+			})
+		}
+	}
+
+	return nil, nil, fmt.Errorf("tool-call loop exceeded %d iterations", maxIter)
+}
+
+// callOnce performs a single DeepSeek invocation, instrumented with one
+// deepseek.chat span carrying gen_ai attributes and token usage.
+func (s *Server) callOnce(
+	ctx context.Context,
+	model string,
+	messages []deepseek.ChatCompletionMessage,
+	tools []deepseek.Tool,
+	iter int,
 ) (*deepseek.ChatCompletionResponse, error) {
 	ctx, span := s.tracer.Start(ctx, "deepseek.chat",
 		trace.WithAttributes(
@@ -67,14 +154,21 @@ func (s *Server) chat(
 			attribute.String("gen_ai.operation.name", "chat"),
 			attribute.String("gen_ai.request.model", model),
 			attribute.Int("gen_ai.request.message_count", len(messages)),
+			attribute.Int("dpal.tool_iteration", iter),
+			attribute.Int("dpal.tools_offered", len(tools)),
 		),
 	)
 	defer span.End()
 
-	resp, err := s.client.CreateChatCompletion(ctx, &deepseek.ChatCompletionRequest{
+	req := &deepseek.ChatCompletionRequest{
 		Model:    model,
 		Messages: messages,
-	})
+	}
+	if len(tools) > 0 {
+		req.Tools = tools
+	}
+
+	resp, err := s.client.CreateChatCompletion(ctx, req)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
@@ -88,7 +182,26 @@ func (s *Server) chat(
 		attribute.Int("deepseek.usage.cache_hit_tokens", resp.Usage.PromptCacheHitTokens),
 		attribute.Int("deepseek.usage.cache_miss_tokens", resp.Usage.PromptCacheMissTokens),
 	)
+	if len(resp.Choices) > 0 {
+		span.SetAttributes(
+			attribute.String("gen_ai.response.finish_reason", resp.Choices[0].FinishReason),
+			attribute.Int("dpal.response.tool_call_count", len(resp.Choices[0].Message.ToolCalls)),
+		)
+	}
 	return resp, nil
+}
+
+func (s *Server) dispatchToolCall(ctx context.Context, tc deepseek.ToolCall) string {
+	_, span := s.tracer.Start(ctx, "explorer.tool_call",
+		trace.WithAttributes(
+			attribute.String("tool.name", tc.Function.Name),
+			attribute.String("tool.call_id", tc.ID),
+		),
+	)
+	defer span.End()
+	out := s.explorer.Dispatch(tc.Function.Name, tc.Function.Arguments)
+	span.SetAttributes(attribute.Int("tool.result_bytes", len(out)))
+	return out
 }
 
 type OneshotInput struct {
@@ -116,7 +229,7 @@ func (s *Server) ConsultOneshot(
 		model = s.defaultModel
 	}
 
-	resp, err := s.chat(ctx, model, []deepseek.ChatCompletionMessage{
+	resp, _, err := s.chat(ctx, model, []deepseek.ChatCompletionMessage{
 		{Role: deepseek.ChatMessageRoleUser, Content: in.Prompt},
 	})
 	if err != nil {
@@ -177,28 +290,26 @@ func (s *Server) Consult(
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
-	sess.messages = append(sess.messages, deepseek.ChatCompletionMessage{
+	// Build the candidate transcript without mutating sess.messages —
+	// chat() takes a defensive copy, but assembling the candidate
+	// fresh means a failed call leaves the durable session untouched.
+	candidate := make([]deepseek.ChatCompletionMessage, 0, len(sess.messages)+1)
+	candidate = append(candidate, sess.messages...)
+	candidate = append(candidate, deepseek.ChatCompletionMessage{
 		Role:    deepseek.ChatMessageRoleUser,
 		Content: in.Prompt,
 	})
 
-	resp, err := s.chat(ctx, model, sess.messages)
+	resp, updated, err := s.chat(ctx, model, candidate)
 	if err != nil {
-		// Roll back the user turn we speculatively appended so a retry
-		// from the client doesn't double-send the same prompt.
-		sess.messages = sess.messages[:len(sess.messages)-1]
 		return nil, ConsultOutput{}, fmt.Errorf("deepseek call failed: %w", err)
 	}
 	if len(resp.Choices) == 0 {
-		sess.messages = sess.messages[:len(sess.messages)-1]
 		return nil, ConsultOutput{}, fmt.Errorf("deepseek returned no choices")
 	}
 
+	sess.messages = updated
 	msg := resp.Choices[0].Message
-	sess.messages = append(sess.messages, deepseek.ChatCompletionMessage{
-		Role:    deepseek.ChatMessageRoleAssistant,
-		Content: msg.Content,
-	})
 
 	turnCount := 0
 	for _, m := range sess.messages {
