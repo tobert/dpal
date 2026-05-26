@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,7 +29,8 @@ func main() {
 
 func run(args []string, getenv func(string) string) error {
 	fs := flag.NewFlagSet("dpal", flag.ContinueOnError)
-	apiKeyFlag := fs.String("api-key", "", "DeepSeek API key (overrides DEEPSEEK_API_KEY)")
+	apiKeyFlag := fs.String("api-key", "", "DeepSeek API key (visible via 'ps'; prefer --api-key-file)")
+	apiKeyFileFlag := fs.String("api-key-file", "", "Path to a file containing the DeepSeek API key; read at every startup")
 	otelEndpointFlag := fs.String("otel-endpoint", "", "OTLP endpoint, e.g. localhost:4317 (gRPC) or localhost:4318 (HTTP). Overrides OTEL_EXPORTER_OTLP_ENDPOINT; empty disables OTel.")
 	otelProtocolFlag := fs.String("otel-protocol", "", "OTLP transport: 'grpc' (default) or 'http/protobuf'. Overrides OTEL_EXPORTER_OTLP_PROTOCOL.")
 	otelInsecureFlag := fs.Bool("otel-insecure", true, "Send OTLP traces in plaintext (set false to require TLS)")
@@ -44,12 +46,9 @@ func run(args []string, getenv func(string) string) error {
 		return nil
 	}
 
-	apiKey := *apiKeyFlag
-	if apiKey == "" {
-		apiKey = getenv("DEEPSEEK_API_KEY")
-	}
-	if apiKey == "" {
-		return fmt.Errorf("API key required: pass --api-key or set DEEPSEEK_API_KEY")
+	apiKey, err := resolveAPIKey(*apiKeyFlag, *apiKeyFileFlag, getenv)
+	if err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -71,15 +70,15 @@ func run(args []string, getenv func(string) string) error {
 		serviceName = "dpal"
 	}
 
-	shutdown, err := otelinit.Bootstrap(ctx, otelinit.Config{
+	shutdown, otelErr := otelinit.Bootstrap(ctx, otelinit.Config{
 		Endpoint:    otelEndpoint,
 		Protocol:    otelProtocol,
 		ServiceName: serviceName,
 		Version:     version,
 		Insecure:    *otelInsecureFlag,
 	})
-	if err != nil {
-		return fmt.Errorf("otel init: %w", err)
+	if otelErr != nil {
+		return fmt.Errorf("otel init: %w", otelErr)
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -91,9 +90,9 @@ func run(args []string, getenv func(string) string) error {
 	srv := server.New(client).WithVersion(version)
 
 	if !*noExploreFlag {
-		exp, err := explorer.New(*rootFlag)
-		if err != nil {
-			return fmt.Errorf("explorer: %w", err)
+		exp, expErr := explorer.New(*rootFlag)
+		if expErr != nil {
+			return fmt.Errorf("explorer: %w", expErr)
 		}
 		srv = srv.WithExplorer(exp)
 	}
@@ -105,4 +104,35 @@ func run(args []string, getenv func(string) string) error {
 	srv.Register(mcpServer)
 
 	return mcpServer.Run(ctx, &mcp.StdioTransport{})
+}
+
+// resolveAPIKey applies the precedence rule:
+//
+//   --api-key  XOR  --api-key-file  ->  DEEPSEEK_API_KEY
+//
+// Both flags together is an error so the caller's intent isn't
+// ambiguous. The file path is read fresh on every startup and trimmed
+// of surrounding whitespace, so a trailing newline is fine.
+func resolveAPIKey(fromFlag, fromFile string, getenv func(string) string) (string, error) {
+	if fromFlag != "" && fromFile != "" {
+		return "", fmt.Errorf("--api-key and --api-key-file are mutually exclusive")
+	}
+	if fromFlag != "" {
+		return fromFlag, nil
+	}
+	if fromFile != "" {
+		data, err := os.ReadFile(fromFile)
+		if err != nil {
+			return "", fmt.Errorf("read --api-key-file: %w", err)
+		}
+		key := strings.TrimSpace(string(data))
+		if key == "" {
+			return "", fmt.Errorf("--api-key-file %q is empty", fromFile)
+		}
+		return key, nil
+	}
+	if env := getenv("DEEPSEEK_API_KEY"); env != "" {
+		return env, nil
+	}
+	return "", fmt.Errorf("API key required: pass --api-key-file (recommended), --api-key, or set DEEPSEEK_API_KEY")
 }

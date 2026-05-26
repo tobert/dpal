@@ -50,15 +50,16 @@ go build ./cmd/dpal         # leaves ./dpal in the project dir
 
 ## Install into Claude Code
 
-Save your DeepSeek API key to `~/.deepseek-key` (one line, no trailing
-newline matters since `$(< ...)` strips it), then register dpal as a
-user-scope MCP server:
+Save your DeepSeek API key to `~/.deepseek-key` (`chmod 600` recommended)
+and register dpal as a user-scope MCP server. `--api-key-file` re-reads
+the file on every startup, so rotating the key is a one-line edit — no
+need to re-run `claude mcp add`, and the key never lands in Claude
+Code's MCP config or in `ps` output.
 
 ```sh
 claude mcp add dpal \
     -s user \
-    -e "DEEPSEEK_API_KEY=$(< ~/.deepseek-key)" \
-    -- ~/go/bin/dpal
+    -- ~/go/bin/dpal --api-key-file ~/.deepseek-key
 ```
 
 With a local OTel collector listening on the default OTLP HTTP port
@@ -67,15 +68,11 @@ With a local OTel collector listening on the default OTLP HTTP port
 ```sh
 claude mcp add dpal \
     -s user \
-    -e "DEEPSEEK_API_KEY=$(< ~/.deepseek-key)" \
     -- ~/go/bin/dpal \
+       --api-key-file ~/.deepseek-key \
        --otel-endpoint localhost:4318 \
        --otel-protocol http/protobuf
 ```
-
-(`$(< ~/.deepseek-key)` is expanded by the shell at `claude mcp add`
-time, so the resolved key is stored in Claude Code's MCP config. Re-run
-the command to rotate.)
 
 Inspect or remove with `claude mcp list`, `claude mcp get dpal`, or
 `claude mcp remove dpal`.
@@ -93,7 +90,8 @@ Speaks MCP over stdio.
 
 | flag | env fallback | default |
 | --- | --- | --- |
-| `--api-key` | `DEEPSEEK_API_KEY` | (required) |
+| `--api-key-file` | `DEEPSEEK_API_KEY` | (one of the three is required) |
+| `--api-key` | `DEEPSEEK_API_KEY` | (visible via `ps`; prefer `--api-key-file`) |
 | `--root` | — | `.` |
 | `--no-explore` | — | `false` |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | empty (OTel disabled) |
