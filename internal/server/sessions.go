@@ -8,13 +8,26 @@ import (
 
 const defaultMaxSessions = 100
 
+// ReasoningEntry is one R1 reasoning_content payload captured at a
+// specific turn. Stored parallel to Session.messages — never replayed
+// to the model, but kept for display via dpal://session/{id}.
+type ReasoningEntry struct {
+	TurnIndex int    `json:"turn_index"` // 1-based user-turn index this reasoning answered
+	Content   string `json:"content"`
+}
+
 // Session holds the running chat history for one conversation.
-// Callers must hold mu while reading or mutating messages.
+// Callers must hold mu while reading or mutating messages or reasoning.
+//
+// accessN is the LRU generation counter and is owned by the parent
+// Sessions: it is only read or written under Sessions.mu (never under
+// sess.mu), so accessing it from anywhere else is a data race.
 type Session struct {
-	id       string
-	mu       sync.Mutex
-	messages []deepseek.ChatCompletionMessage
-	accessN  uint64 // generation counter used for LRU eviction
+	id        string
+	mu        sync.Mutex
+	messages  []deepseek.ChatCompletionMessage
+	reasoning []ReasoningEntry
+	accessN   uint64
 }
 
 // ID returns the session identifier.
@@ -90,30 +103,41 @@ type TranscriptMessage struct {
 // Snapshot returns lightweight metadata for every stored session,
 // sorted by AccessGen ascending (oldest-first). Briefly locks each
 // session to read message count, so concurrent writes serialise.
+//
+// Pointers and access generations are copied under the map lock and
+// iterated after release, so a concurrent Acquire that triggers
+// eviction may produce a result containing entries that are no longer
+// in the live map. The per-session lock keeps the message read itself
+// safe; callers just shouldn't treat the snapshot as authoritative for
+// "is X still tracked".
 func (s *Sessions) Snapshot() []SessionInfo {
+	type entry struct {
+		sess    *Session
+		accessN uint64 // captured under s.mu — owner of accessN
+	}
 	s.mu.Lock()
-	all := make([]*Session, 0, len(s.byID))
+	all := make([]entry, 0, len(s.byID))
 	for _, sess := range s.byID {
-		all = append(all, sess)
+		all = append(all, entry{sess: sess, accessN: sess.accessN})
 	}
 	s.mu.Unlock()
 
 	out := make([]SessionInfo, 0, len(all))
-	for _, sess := range all {
-		sess.mu.Lock()
+	for _, e := range all {
+		e.sess.mu.Lock()
 		userTurns := 0
-		for _, m := range sess.messages {
+		for _, m := range e.sess.messages {
 			if m.Role == "user" {
 				userTurns++
 			}
 		}
 		out = append(out, SessionInfo{
-			ID:           sess.id,
-			MessageCount: len(sess.messages),
+			ID:           e.sess.id,
+			MessageCount: len(e.sess.messages),
 			UserTurns:    userTurns,
-			AccessGen:    sess.accessN,
+			AccessGen:    e.accessN,
 		})
-		sess.mu.Unlock()
+		e.sess.mu.Unlock()
 	}
 
 	// Sort by AccessGen so output is deterministic.
@@ -141,6 +165,24 @@ func (s *Sessions) Transcript(id string) ([]TranscriptMessage, bool) {
 	for i, m := range sess.messages {
 		out[i] = TranscriptMessage{Role: m.Role, Content: m.Content}
 	}
+	return out, true
+}
+
+// Reasoning returns a deep copy of the per-turn reasoning log for id.
+// Empty slice (not nil) when the session exists but has no R1 turns
+// recorded; (nil, false) when no such session exists.
+func (s *Sessions) Reasoning(id string) ([]ReasoningEntry, bool) {
+	s.mu.Lock()
+	sess, ok := s.byID[id]
+	s.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	out := make([]ReasoningEntry, len(sess.reasoning))
+	copy(out, sess.reasoning)
 	return out, true
 }
 

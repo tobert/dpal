@@ -226,6 +226,33 @@ func TestSearchProject_SkipsGitDir(t *testing.T) {
 	}
 }
 
+func TestSearchProject_ReportsUnreadableFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission semantics differ on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits; cannot make a file unreadable")
+	}
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "ok.go", "// MATCHME\n")
+	denied := filepath.Join(dir, "denied.go")
+	if err := os.WriteFile(denied, []byte("// MATCHME\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(denied, 0o644) })
+
+	out, err := exp.SearchProject("MATCHME", "*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "ok.go") {
+		t.Errorf("readable file should still match:\n%s", out)
+	}
+	if !strings.Contains(out, "unreadable") {
+		t.Errorf("expected footer to mention unreadable files:\n%s", out)
+	}
+}
+
 func TestSearchProject_RejectsBadRegex(t *testing.T) {
 	exp, _ := newTestExplorer(t)
 	if _, err := exp.SearchProject("[unclosed", ""); err == nil {

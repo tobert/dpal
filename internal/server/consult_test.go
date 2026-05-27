@@ -185,6 +185,39 @@ func TestConsult_FailedCallRollsBackHistory(t *testing.T) {
 	}
 }
 
+func TestConsult_RecordsReasoningParallelToHistory(t *testing.T) {
+	// reasoning_content is stripped from outbound history (covered above),
+	// but we still keep it per-turn for dpal://session/{id} display.
+	rec := &recordingClient{
+		responses: []*deepseek.ChatCompletionResponse{
+			makeResp("first answer", "first thinking"),
+			makeResp("second answer", ""), // V3 turn — no reasoning
+			makeResp("third answer", "third thinking"),
+		},
+	}
+	s := New(rec)
+
+	for _, p := range []string{"Q1", "Q2", "Q3"} {
+		if _, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: p}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, ok := s.sessions.Reasoning("s1")
+	if !ok {
+		t.Fatal("Reasoning returned ok=false for known session")
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(reasoning) = %d, want 2 (only R1 turns have reasoning)", len(got))
+	}
+	if got[0].TurnIndex != 1 || got[0].Content != "first thinking" {
+		t.Errorf("reasoning[0] = %+v", got[0])
+	}
+	if got[1].TurnIndex != 3 || got[1].Content != "third thinking" {
+		t.Errorf("reasoning[1] = %+v", got[1])
+	}
+}
+
 func TestConsult_HonorsModelOverride(t *testing.T) {
 	rec := &recordingClient{
 		responses: []*deepseek.ChatCompletionResponse{makeResp("ok", "")},
@@ -197,5 +230,85 @@ func TestConsult_HonorsModelOverride(t *testing.T) {
 	}
 	if rec.requests[0].Model != deepseek.DeepSeekChat {
 		t.Errorf("request model = %q, want %q", rec.requests[0].Model, deepseek.DeepSeekChat)
+	}
+}
+
+func TestConsult_PrependsServerSystemPrompt(t *testing.T) {
+	rec := &recordingClient{responses: []*deepseek.ChatCompletionResponse{makeResp("ok", "")}}
+	s := New(rec).WithSystemPrompt("be precise")
+
+	if _, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	msgs := rec.requests[0].Messages
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2 (system + user)", len(msgs))
+	}
+	if msgs[0].Role != deepseek.ChatMessageRoleSystem || msgs[0].Content != "be precise" {
+		t.Errorf("msg[0] = {%q, %q}", msgs[0].Role, msgs[0].Content)
+	}
+	if msgs[1].Role != deepseek.ChatMessageRoleUser {
+		t.Errorf("msg[1] role = %q, want user", msgs[1].Role)
+	}
+}
+
+func TestConsult_PerCallSystemPromptOverrides(t *testing.T) {
+	rec := &recordingClient{responses: []*deepseek.ChatCompletionResponse{makeResp("ok", "")}}
+	s := New(rec).WithSystemPrompt("server default")
+
+	_, _, err := s.Consult(context.Background(), nil, ConsultInput{
+		SessionID:    "s1",
+		Prompt:       "hi",
+		SystemPrompt: "call-scoped override",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.requests[0].Messages[0].Content; got != "call-scoped override" {
+		t.Errorf("system prompt = %q, want override", got)
+	}
+}
+
+func TestConsult_SystemPromptNotStoredInSessionHistory(t *testing.T) {
+	// Crucial: changing the prompt between turns must not rewrite past
+	// history. Session messages stay user/assistant only.
+	rec := &recordingClient{responses: []*deepseek.ChatCompletionResponse{
+		makeResp("first", ""), makeResp("second", ""),
+	}}
+	s := New(rec).WithSystemPrompt("prompt A")
+
+	if _, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "Q1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Consult(context.Background(), nil, ConsultInput{
+		SessionID: "s1", Prompt: "Q2", SystemPrompt: "prompt B",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second request: system=B, then user/assistant/user only.
+	msgs := rec.requests[1].Messages
+	if len(msgs) != 4 {
+		t.Fatalf("got %d messages, want 4 (sys, user, assistant, user)", len(msgs))
+	}
+	if msgs[0].Role != deepseek.ChatMessageRoleSystem || msgs[0].Content != "prompt B" {
+		t.Errorf("msg[0] = {%q, %q}", msgs[0].Role, msgs[0].Content)
+	}
+	for _, m := range msgs[1:] {
+		if m.Role == deepseek.ChatMessageRoleSystem {
+			t.Errorf("unexpected stored system message in history: %+v", m)
+		}
+	}
+}
+
+func TestConsult_NoSystemPromptMeansNoSystemMessage(t *testing.T) {
+	rec := &recordingClient{responses: []*deepseek.ChatCompletionResponse{makeResp("ok", "")}}
+	s := New(rec) // no WithSystemPrompt
+
+	if _, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if rec.requests[0].Messages[0].Role == deepseek.ChatMessageRoleSystem {
+		t.Errorf("expected no system message when none configured; got %+v", rec.requests[0].Messages[0])
 	}
 }

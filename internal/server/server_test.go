@@ -110,3 +110,44 @@ func TestConsultOneshot_RejectsEmptyChoices(t *testing.T) {
 		t.Fatal("expected error for empty choices, got nil")
 	}
 }
+
+func TestUsageSnapshot_AggregatesPerModel(t *testing.T) {
+	rec := &recordingClient{
+		responses: []*deepseek.ChatCompletionResponse{
+			makeRespWithUsage("deepseek-chat", "a", "", 10, 20, 5, 5),
+			makeRespWithUsage("deepseek-chat", "b", "", 100, 30, 80, 20),
+			makeRespWithUsage("deepseek-reasoner", "c", "", 50, 200, 0, 50),
+		},
+	}
+	s := New(rec)
+	ctx := context.Background()
+	for range 3 {
+		if _, _, err := s.ConsultOneshot(ctx, nil, OneshotInput{Prompt: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snap := s.UsageSnapshot()
+	if len(snap) != 2 {
+		t.Fatalf("got %d models, want 2", len(snap))
+	}
+	// Sort guarantees deepseek-chat is first.
+	chat, reasoner := snap[0], snap[1]
+	if chat.Model != "deepseek-chat" || reasoner.Model != "deepseek-reasoner" {
+		t.Fatalf("unexpected order: %s, %s", chat.Model, reasoner.Model)
+	}
+	if chat.Calls != 2 || chat.InputTokens != 110 || chat.OutputTokens != 50 || chat.CacheHitTokens != 85 || chat.CacheMissTokens != 25 {
+		t.Errorf("chat usage = %+v", chat)
+	}
+	if reasoner.Calls != 1 || reasoner.InputTokens != 50 || reasoner.OutputTokens != 200 {
+		t.Errorf("reasoner usage = %+v", reasoner)
+	}
+}
+
+func TestUsageSnapshot_NoCallsReturnsEmpty(t *testing.T) {
+	s := New(&fakeClient{})
+	snap := s.UsageSnapshot()
+	if len(snap) != 0 {
+		t.Errorf("expected empty snapshot, got %d entries", len(snap))
+	}
+}

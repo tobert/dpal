@@ -30,9 +30,9 @@ func attrIndex(span tracetest.SpanStub) map[string]any {
 	return out
 }
 
-func makeRespWithUsage(content, reasoning string, in, out, hit, miss int) *deepseek.ChatCompletionResponse {
+func makeRespWithUsage(model, content, reasoning string, in, out, hit, miss int) *deepseek.ChatCompletionResponse {
 	return &deepseek.ChatCompletionResponse{
-		Model: "deepseek-reasoner",
+		Model: model,
 		Choices: []deepseek.Choice{{Message: deepseek.Message{
 			Role:             deepseek.ChatMessageRoleAssistant,
 			Content:          content,
@@ -49,7 +49,7 @@ func makeRespWithUsage(content, reasoning string, in, out, hit, miss int) *deeps
 
 func TestOneshot_EmitsSpanWithGenAIAttributes(t *testing.T) {
 	tracer, exporter := newTestTracer()
-	rec := &fakeClient{resp: makeRespWithUsage("hi", "thinking", 12, 7, 4, 8)}
+	rec := &fakeClient{resp: makeRespWithUsage("deepseek-reasoner", "hi", "thinking", 12, 7, 4, 8)}
 	s := New(rec).WithTracer(tracer)
 
 	if _, _, err := s.ConsultOneshot(context.Background(), nil, OneshotInput{Prompt: "hello"}); err != nil {
@@ -111,8 +111,8 @@ func TestConsult_EmitsOneSpanPerTurn(t *testing.T) {
 	tracer, exporter := newTestTracer()
 	rec := &recordingClient{
 		responses: []*deepseek.ChatCompletionResponse{
-			makeRespWithUsage("a", "", 1, 1, 0, 1),
-			makeRespWithUsage("b", "", 2, 1, 0, 2),
+			makeRespWithUsage("deepseek-reasoner", "a", "", 1, 1, 0, 1),
+			makeRespWithUsage("deepseek-reasoner", "b", "", 2, 1, 0, 2),
 		},
 	}
 	s := New(rec).WithTracer(tracer)
@@ -138,7 +138,7 @@ func TestConsult_EmitsOneSpanPerTurn(t *testing.T) {
 
 func TestChat_NestsUnderParentContext(t *testing.T) {
 	tracer, exporter := newTestTracer()
-	rec := &fakeClient{resp: makeRespWithUsage("ok", "", 1, 1, 0, 1)}
+	rec := &fakeClient{resp: makeRespWithUsage("deepseek-reasoner", "ok", "", 1, 1, 0, 1)}
 	s := New(rec).WithTracer(tracer)
 
 	parentCtx, parent := tracer.Start(context.Background(), "incoming.tool_call")

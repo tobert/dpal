@@ -19,11 +19,12 @@ const (
 
 // InfoPayload is the JSON body served at dpal://info.
 type InfoPayload struct {
-	Name           string `json:"name"`
-	Version        string `json:"version"`
-	DefaultModel   string `json:"default_model"`
-	SessionCap     int    `json:"session_cap"`
-	ActiveSessions int    `json:"active_sessions"`
+	Name           string       `json:"name"`
+	Version        string       `json:"version"`
+	DefaultModel   string       `json:"default_model"`
+	SessionCap     int          `json:"session_cap"`
+	ActiveSessions int          `json:"active_sessions"`
+	Usage          []ModelUsage `json:"usage"`
 }
 
 // SessionsPayload is the JSON body served at dpal://sessions.
@@ -35,8 +36,9 @@ type SessionsPayload struct {
 
 // SessionPayload is the JSON body served at dpal://session/{id}.
 type SessionPayload struct {
-	ID       string              `json:"id"`
-	Messages []TranscriptMessage `json:"messages"`
+	ID        string              `json:"id"`
+	Messages  []TranscriptMessage `json:"messages"`
+	Reasoning []ReasoningEntry    `json:"reasoning"`
 }
 
 func (s *Server) infoJSON() ([]byte, error) {
@@ -46,6 +48,7 @@ func (s *Server) infoJSON() ([]byte, error) {
 		DefaultModel:   s.defaultModel,
 		SessionCap:     s.sessions.maxSize,
 		ActiveSessions: s.sessions.Len(),
+		Usage:          s.UsageSnapshot(),
 	}, "", "  ")
 }
 
@@ -63,9 +66,14 @@ func (s *Server) sessionJSON(id string) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("no session with id %q", id)
 	}
+	// Reasoning lookup is best-effort — Transcript already confirmed the
+	// session exists; eviction between the two reads would yield nil/false
+	// here, which we surface as an empty reasoning list rather than error.
+	reasoning, _ := s.sessions.Reasoning(id)
 	return json.MarshalIndent(SessionPayload{
-		ID:       id,
-		Messages: msgs,
+		ID:        id,
+		Messages:  msgs,
+		Reasoning: reasoning,
 	}, "", "  ")
 }
 

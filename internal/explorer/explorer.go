@@ -209,11 +209,13 @@ func (e *Explorer) SearchProject(pattern, glob string) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "search pattern=%q glob=%q\n", pattern, glob)
 	hits := 0
+	skipped := 0
 	truncated := false
 
 	walkErr := filepath.WalkDir(e.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // skip unreadable entries
+			skipped++
+			return nil
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -233,11 +235,16 @@ func (e *Explorer) SearchProject(pattern, glob string) (string, error) {
 			}
 		}
 		info, err := d.Info()
-		if err != nil || info.Size() > e.maxSearchBytes {
+		if err != nil {
+			skipped++
+			return nil
+		}
+		if info.Size() > e.maxSearchBytes {
 			return nil
 		}
 		data, err := os.ReadFile(p)
 		if err != nil {
+			skipped++
 			return nil
 		}
 		rel, _ := filepath.Rel(e.root, p)
@@ -257,7 +264,11 @@ func (e *Explorer) SearchProject(pattern, glob string) (string, error) {
 	if walkErr != nil {
 		return "", fmt.Errorf("search_project: walk: %w", walkErr)
 	}
-	fmt.Fprintf(&b, "(%d hit(s)%s)\n", hits, ternary(truncated, ", capped", ""))
+	fmt.Fprintf(&b, "(%d hit(s)%s", hits, ternary(truncated, ", capped", ""))
+	if skipped > 0 {
+		fmt.Fprintf(&b, "; %d file(s) unreadable", skipped)
+	}
+	fmt.Fprintf(&b, ")\n")
 	return b.String(), nil
 }
 

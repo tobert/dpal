@@ -113,3 +113,39 @@ func TestE2E_ToolLoopReadsSandboxedFile(t *testing.T) {
 	}
 	t.Logf("tool-loop final content: %q", out.Content)
 }
+
+// TestE2E_R1ToolLoopReadsSandboxedFile is the matched companion to the
+// V3 test above, deliberately using deepseek-reasoner (R1). R1's
+// function-calling has historically been spotty; this test will reveal
+// whether the default model can drive the explorer. If it stops
+// working, the failure here gates whether we should default tool-loop
+// calls to V3 even when R1 is the user-selected model.
+func TestE2E_R1ToolLoopReadsSandboxedFile(t *testing.T) {
+	client := deepseek.NewClient(requireKey(t))
+
+	dir := t.TempDir()
+	const magic = "AVOCADO_99"
+	if err := os.WriteFile(filepath.Join(dir, "secret.txt"),
+		[]byte("the magic password is "+magic+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exp, err := explorer.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(client).WithExplorer(exp)
+
+	_, out, err := srv.ConsultOneshot(context.Background(), nil, server.OneshotInput{
+		Prompt: "There is a file named secret.txt in the current directory. Use the read_file tool to read it, then tell me what the magic password is. Reply with just the password, nothing else.",
+		Model:  deepseek.DeepSeekReasoner,
+	})
+	if err != nil {
+		t.Fatalf("R1 tool loop: %v", err)
+	}
+	if !strings.Contains(out.Content, magic) {
+		t.Errorf("R1 did not surface password from file; got %q (reasoning: %d chars)",
+			out.Content, len(out.ReasoningContent))
+	}
+	t.Logf("R1 tool-loop final content: %q", out.Content)
+}

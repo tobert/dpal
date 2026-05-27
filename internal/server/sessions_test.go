@@ -1,6 +1,12 @@
 package server
 
-import "testing"
+import (
+	"fmt"
+	"sync"
+	"testing"
+
+	deepseek "github.com/cohesion-org/deepseek-go"
+)
 
 func TestSessions_AcquireCreatesNewSession(t *testing.T) {
 	s := NewSessions(10)
@@ -80,5 +86,52 @@ func TestSessions_ZeroMaxDisablesCap(t *testing.T) {
 	}
 	if s.Len() != 50 {
 		t.Errorf("Len = %d, want 50 (cap disabled)", s.Len())
+	}
+}
+
+// TestSessions_ConcurrentAccess hammers Acquire/Snapshot/Transcript
+// from many goroutines under -race. Two-tier locking (map mu + per-session
+// mu) is correct by inspection; this guards against future regressions.
+// Eviction is active: cap << goroutine count, so the LRU path is exercised.
+func TestSessions_ConcurrentAccess(t *testing.T) {
+	const (
+		goroutines    = 32
+		opsPerWorker  = 200
+		sessionPool   = 16 // distinct IDs cycled through
+		capacity      = 4  // forces frequent eviction
+	)
+
+	s := NewSessions(capacity)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for g := range goroutines {
+		go func(g int) {
+			defer wg.Done()
+			for op := range opsPerWorker {
+				id := fmt.Sprintf("sess-%d", (g+op)%sessionPool)
+				switch op % 4 {
+				case 0:
+					sess := s.Acquire(id)
+					sess.mu.Lock()
+					sess.messages = append(sess.messages, deepseek.ChatCompletionMessage{
+						Role: deepseek.ChatMessageRoleUser, Content: "x",
+					})
+					sess.mu.Unlock()
+				case 1:
+					_ = s.Snapshot()
+				case 2:
+					_, _ = s.Transcript(id)
+				case 3:
+					_, _ = s.Reasoning(id)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// After eviction churn the live count is bounded by the cap.
+	if got := s.Len(); got > capacity {
+		t.Errorf("Len = %d, want <= cap=%d", got, capacity)
 	}
 }

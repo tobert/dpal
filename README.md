@@ -102,9 +102,13 @@ Speaks MCP over stdio.
 | --- | --- | --- |
 | `--api-key-file` | `DEEPSEEK_API_KEY` | (one of the three is required) |
 | `--api-key` | `DEEPSEEK_API_KEY` | (visible via `ps`; prefer `--api-key-file`) |
-| `--root` | — | `.` |
+| `--root` | — | `.` (fallback when MCP client doesn't advertise roots/list; if it does, dpal uses the first advertised root and logs any extras) |
 | `--no-explore` | — | `false` |
+| `--config` | — | `$XDG_CONFIG_HOME/dpal/config.toml` (or `~/.config/dpal/config.toml`) |
+| `--system-prompt` | — | (repeatable; appends file contents to the system prompt) |
+| `--no-default-prompt` | — | `false` (suppresses the built-in DeepSeek-shaped prompt) |
 | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | empty (OTel disabled) |
+| `--otel-endpoint-file` | — | (re-read every startup; pairs well with collectors on ephemeral ports) |
 | `--otel-protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` |
 | `--otel-insecure` | — | `true` |
 | `--version` | — | — |

@@ -131,3 +131,66 @@ func TestResolveAPIKey_AllEmptyErrors(t *testing.T) {
 		t.Fatal("expected error when no source provides a key")
 	}
 }
+
+func TestResolveOTelEndpoint_FlagWins(t *testing.T) {
+	got, err := resolveOTelEndpoint("from-flag", "", envWith("OTEL_EXPORTER_OTLP_ENDPOINT", "from-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "from-flag" {
+		t.Errorf("got %q, want from-flag", got)
+	}
+}
+
+func TestResolveOTelEndpoint_FileWinsOverEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "endpoint")
+	if err := os.WriteFile(path, []byte("127.0.0.1:46861\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveOTelEndpoint("", path, envWith("OTEL_EXPORTER_OTLP_ENDPOINT", "from-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "127.0.0.1:46861" {
+		t.Errorf("got %q, want trimmed file contents", got)
+	}
+}
+
+func TestResolveOTelEndpoint_RejectsBothFlagAndFile(t *testing.T) {
+	_, err := resolveOTelEndpoint("from-flag", "/some/path", emptyEnv)
+	if err == nil {
+		t.Fatal("expected error when both flag and file set")
+	}
+}
+
+func TestResolveOTelEndpoint_EmptyFileErrors(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "endpoint")
+	if err := os.WriteFile(path, []byte("  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveOTelEndpoint("", path, emptyEnv); err == nil {
+		t.Fatal("expected error for empty endpoint file")
+	}
+}
+
+func TestResolveOTelEndpoint_EnvFallbacks(t *testing.T) {
+	got, err := resolveOTelEndpoint("", "", envWith("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "traces-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "traces-env" {
+		t.Errorf("got %q, want traces-env (second env fallback)", got)
+	}
+}
+
+func TestResolveOTelEndpoint_AllEmptyReturnsEmpty(t *testing.T) {
+	got, err := resolveOTelEndpoint("", "", emptyEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Errorf("got %q, want empty (otel is opt-in)", got)
+	}
+}

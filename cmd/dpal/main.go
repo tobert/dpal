@@ -32,10 +32,15 @@ func run(args []string, getenv func(string) string) error {
 	apiKeyFlag := fs.String("api-key", "", "DeepSeek API key (visible via 'ps'; prefer --api-key-file)")
 	apiKeyFileFlag := fs.String("api-key-file", "", "Path to a file containing the DeepSeek API key; read at every startup")
 	otelEndpointFlag := fs.String("otel-endpoint", "", "OTLP endpoint, e.g. localhost:4317 (gRPC) or localhost:4318 (HTTP). Overrides OTEL_EXPORTER_OTLP_ENDPOINT; empty disables OTel.")
+	otelEndpointFileFlag := fs.String("otel-endpoint-file", "", "Path to a file containing the OTLP endpoint; read at every startup (matches --api-key-file). Useful for collectors that bind a random port at startup.")
 	otelProtocolFlag := fs.String("otel-protocol", "", "OTLP transport: 'grpc' (default) or 'http/protobuf'. Overrides OTEL_EXPORTER_OTLP_PROTOCOL.")
 	otelInsecureFlag := fs.Bool("otel-insecure", true, "Send OTLP traces in plaintext (set false to require TLS)")
 	rootFlag := fs.String("root", ".", "Directory DeepSeek may inspect via list_directory/read_file/search_project. Combine with --no-explore to disable entirely.")
 	noExploreFlag := fs.Bool("no-explore", false, "Disable the exploration tools (list_directory, read_file, search_project)")
+	configFlag := fs.String("config", "", "Path to TOML config (default: $XDG_CONFIG_HOME/dpal/config.toml or ~/.config/dpal/config.toml)")
+	noDefaultPromptFlag := fs.Bool("no-default-prompt", false, "Suppress the built-in DeepSeek system prompt")
+	var systemPromptFiles stringSliceFlag
+	fs.Var(&systemPromptFiles, "system-prompt", "Path to a file whose contents append to the system prompt. Repeatable.")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -54,12 +59,9 @@ func run(args []string, getenv func(string) string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	otelEndpoint := *otelEndpointFlag
-	if otelEndpoint == "" {
-		otelEndpoint = getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	}
-	if otelEndpoint == "" {
-		otelEndpoint = getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+	otelEndpoint, err := resolveOTelEndpoint(*otelEndpointFlag, *otelEndpointFileFlag, getenv)
+	if err != nil {
+		return err
 	}
 	otelProtocol := *otelProtocolFlag
 	if otelProtocol == "" {
@@ -88,8 +90,14 @@ func run(args []string, getenv func(string) string) error {
 		}
 	}()
 
+	cfg := loadConfig(*configFlag, getenv)
+	sysPrompt, err := composeSystemPrompt(cfg, systemPromptFiles, *noDefaultPromptFlag)
+	if err != nil {
+		return fmt.Errorf("system prompt: %w", err)
+	}
+
 	client := deepseek.NewClient(apiKey)
-	srv := server.New(client).WithVersion(version)
+	srv := server.New(client).WithVersion(version).WithSystemPrompt(sysPrompt)
 
 	if !*noExploreFlag {
 		exp, expErr := explorer.New(*rootFlag)
@@ -106,6 +114,41 @@ func run(args []string, getenv func(string) string) error {
 	srv.Register(mcpServer)
 
 	return mcpServer.Run(ctx, &mcp.StdioTransport{})
+}
+
+// resolveOTelEndpoint applies the precedence rule:
+//
+//	--otel-endpoint  XOR  --otel-endpoint-file  ->
+//	  OTEL_EXPORTER_OTLP_ENDPOINT  ->  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+//
+// Same shape as resolveAPIKey so collectors that bind ephemeral ports
+// (e.g. otlp-mcp) can be picked up at every dpal startup without
+// re-running 'claude mcp add'.
+func resolveOTelEndpoint(fromFlag, fromFile string, getenv func(string) string) (string, error) {
+	if fromFlag != "" && fromFile != "" {
+		return "", fmt.Errorf("--otel-endpoint and --otel-endpoint-file are mutually exclusive")
+	}
+	if fromFlag != "" {
+		return fromFlag, nil
+	}
+	if fromFile != "" {
+		data, err := os.ReadFile(fromFile)
+		if err != nil {
+			return "", fmt.Errorf("read --otel-endpoint-file: %w", err)
+		}
+		endpoint := strings.TrimSpace(string(data))
+		if endpoint == "" {
+			return "", fmt.Errorf("--otel-endpoint-file %q is empty", fromFile)
+		}
+		return endpoint, nil
+	}
+	if env := getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); env != "" {
+		return env, nil
+	}
+	if env := getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"); env != "" {
+		return env, nil
+	}
+	return "", nil
 }
 
 // resolveAPIKey applies the precedence rule:
