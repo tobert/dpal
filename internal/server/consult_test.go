@@ -93,29 +93,38 @@ func TestConsult_SecondCallIncludesPriorHistory(t *testing.T) {
 	}
 }
 
-func TestConsult_OmitsReasoningContentFromHistory(t *testing.T) {
-	// DeepSeek explicitly instructs callers NOT to echo reasoning_content
-	// back in subsequent requests. This regression test guards that.
+func TestConsult_PreservesReasoningContentInHistory(t *testing.T) {
+	// V4 rule flip: thinking-mode models require reasoning_content to be
+	// replayed in subsequent multi-turn requests that involve tool calls.
+	// (V3/R1 was the opposite — it explicitly forbade replay.) This
+	// regression test guards the new behavior; see CLAUDE.md for the
+	// convention shift.
 	rec := &recordingClient{
 		responses: []*deepseek.ChatCompletionResponse{
-			makeResp("a", "should-not-be-resent"),
+			makeResp("a", "first-turn-reasoning"),
 			makeResp("b", ""),
 		},
 	}
 	s := New(rec)
 
-	_, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "Q1"})
-	if err != nil {
+	if _, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "Q1"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "Q2"}); err != nil {
 		t.Fatal(err)
 	}
 
+	// The second request's history MUST contain the first turn's
+	// reasoning_content, replayed verbatim on the assistant message.
+	var found bool
 	for _, m := range rec.requests[1].Messages {
-		if m.ReasoningContent != "" {
-			t.Fatalf("reasoning_content leaked into history: %q", m.ReasoningContent)
+		if m.Role == deepseek.ChatMessageRoleAssistant && m.ReasoningContent == "first-turn-reasoning" {
+			found = true
+			break
 		}
+	}
+	if !found {
+		t.Fatalf("reasoning_content was not replayed in second-turn history; got messages: %+v", rec.requests[1].Messages)
 	}
 }
 

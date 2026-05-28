@@ -36,16 +36,61 @@ concrete. When an item ships, delete the entry.
 
 ## Productivity / DX
 
-- **No two-phase "explore then synthesize" mode.** gpal's flagship is
-  using cheap Gemini Flash Lite to autonomously read files, then
-  handing the loaded context to Pro/Flash for the actual answer. dpal
-  could do the same with `deepseek-chat` exploring and
-  `deepseek-reasoner` synthesizing. Big lift; worth it once
-  single-model tool loops feel limiting.
-
 - **No streaming.** `CreateChatCompletion` blocks until the full
-  response is back. R1 in particular can take minute-plus on
+  response is back. V4-Pro in thinking mode can take minute-plus on
   reasoning-heavy prompts with no visible progress. deepseek-go
   exposes streaming; need to thread `Server.chat` through it and add
-  an MCP progress-notification path.
+  an MCP progress-notification path. Especially painful now that the
+  two-phase default doubles the silent wait time.
+
+- **No stateful + non-agentic tool.** Today the matrix has
+  `consult_deepseek` (stateful + agentic) and `consult_deepseek_oneshot`
+  (stateless + direct), but no "multi-turn V4 chat without auto-explore."
+  gpal has the same gap. The per-call `disable_explore` flag covers most
+  cases; add a third tool only if someone actually asks. (If you do, name
+  it so the distinction from `consult_deepseek` is obvious — not
+  `consult_deepseek_direct`, which is too close to `oneshot`.)
+
+- **Two-phase loses the prefix cache on model switch.** DeepSeek caches
+  per-model, so switching from `deepseek-v4-flash` (explore) to
+  `deepseek-v4-pro` (synth) starts the synthesizer cold every turn.
+  Acceptable today — the agentic value outweighs the cache cost — but
+  worth measuring if a heavy user complains.
+
+- **No `reasoning_effort` knob.** V4 supports `reasoning_effort` =
+  `"high"`/`"max"` on thinking-mode calls; deepseek-go exposes it via
+  `ExtraFields`. We hardcode the model default (whatever it is). Add a
+  per-call `reasoning_effort` field to `ConsultInput`/`OneshotInput`
+  when someone wants to tune for deeper or shallower thinking.
+
+- **`sess.reasoning` duplicates `sess.messages[*].ReasoningContent`.**
+  After the V4 rule flip, `reasoning_content` lives on the assistant
+  message itself for replay. The parallel `sess.reasoning` array is
+  redundant; only `dpal://session/{id}` reads from it. Refactor:
+  reconstruct the reasoning view by walking `sess.messages` and drop
+  the parallel array.
+
+- **Investigate explorer-loop behavior on broad-scope prompts.** Even
+  with the V4-aware explorer prompt, an open-ended "review everything"
+  scope could push past the 10-iteration cap. We confirmed the new
+  prompt holds for focused tasks (14 tool calls inside the cap on a
+  5-file scope). If broad scopes become a real workflow, options:
+  (a) raise the cap, (b) add code-side repeat-detection (skip
+  duplicate tool calls), (c) further tighten the prompt with a hard
+  numeric file budget.
+
+- **OTel not on by default for the install command.** README's
+  `claude mcp add` example doesn't pass `--otel-endpoint`. When the
+  explorer hits the iteration cap or behaves strangely, there are no
+  traces to inspect. Consider either flipping the install example to
+  include a localhost OTLP target, or adding an in-memory ring buffer
+  of recent tool calls/responses for the `dpal://debug` resource.
+
+## Model migration
+
+- **V4 alias retirement: 2026-07-24.** `deepseek-chat` and
+  `deepseek-reasoner` stop working. dpal already moved to explicit V4
+  IDs (`ModelV4Pro`/`ModelV4Flash`), so this is informational. Watch
+  for the deepseek-go SDK to add V4 constants; replace dpal's locals
+  when they do.
 

@@ -1,7 +1,7 @@
 # dpal
 
-dpal is an MCP server providing access to DeepSeek models, including R1's separate
-reasoning channel.
+dpal is an MCP server providing access to DeepSeek V4 models, surfacing
+thinking-mode reasoning as a separate output channel.
 
 Sibling of [gpal](https://github.com/tobert/gpal) (Gemini) and cpal (Claude),
 implemented in Go on top of the official
@@ -11,18 +11,62 @@ implemented in Go on top of the official
 
 | tool | description |
 | --- | --- |
-| `consult_deepseek_oneshot` | Stateless single prompt. Returns answer + `reasoning_content`. |
-| `consult_deepseek` | Stateful conversation keyed by `session_id`. Up to 100 in-process sessions, evicted LRU when full. |
+| `consult_deepseek` | **Agentic, two-phase, stateful.** Explorer (`deepseek-v4-flash`, non-thinking) reads the codebase via tool calls, then synthesizer (`deepseek-v4-pro` with thinking) writes the answer. Keyed by `session_id`. **Both models are billed.** |
+| `consult_deepseek_oneshot` | Stateless, single direct call. No tools, no explore phase. Defaults to `deepseek-v4-pro` with thinking enabled. One prompt in, one answer out. Use when you've already curated context. |
 
-Both tools surface DeepSeek-R1's `reasoning_content` separately from the
-final answer. Sessions persist for the life of the process (no TTL); use a
-fresh `session_id` to start a new conversation.
+Both surface V4 thinking-mode `reasoning_content` separately from the
+final answer. Up to 100 in-process sessions for `consult_deepseek`,
+evicted LRU when full. Sessions persist for the life of the process
+(no TTL); use a fresh `session_id` to start a new conversation.
 
-### Autonomous exploration
+> **Model migration note.** The legacy `deepseek-chat` and
+> `deepseek-reasoner` aliases route to V4-Flash today but DeepSeek is
+> retiring them on **2026-07-24**. dpal addresses V4 models by explicit
+> ID (`deepseek-v4-pro`, `deepseek-v4-flash`) so it survives the
+> retirement and so `deepseek-v4-pro` can serve as the strong
+> synthesizer instead of V4-Flash-with-thinking.
 
-When `--root` points at a project (default: CWD) and `--no-explore` is not
-set, both tools hand DeepSeek three function-calling tools so the model
-can inspect the codebase on its own during reasoning:
+### Two-phase consultation (the agentic default)
+
+`consult_deepseek` is the flagship — it's why dpal exists as a separate
+project rather than a config tweak on top of a generic OpenAI-API shim.
+Each call runs two phases against the same session history:
+
+1. **Explore.** The explorer model (default `deepseek-v4-flash`, no
+   thinking) sees the user prompt and the project's exploration tools.
+   It reads files, searches code, and stops as soon as it has loaded
+   what the synthesizer will need. Its own final text answer is
+   **stripped** so it doesn't anchor the synthesizer. Thinking mode is
+   off here — exploration is pattern-match-and-load, not deep reasoning.
+2. **Synthesize.** The synthesizer model (default `deepseek-v4-pro` with
+   thinking) sees the user prompt plus all of the explorer's tool
+   exchanges (but not the explorer's answer) and writes the response.
+   Tools are not advertised on this call — the synthesizer reads what
+   the explorer loaded rather than running its own tool loop.
+
+This is the same pattern as gpal's auto mode (Gemini Flash Lite explores,
+Pro/Flash synthesizes), surfaced through DeepSeek V4's thinking channel,
+function calling, and cache visibility.
+
+Per-call overrides on `consult_deepseek`:
+
+| field | default | what it does |
+| --- | --- | --- |
+| `model` | `deepseek-v4-pro` | synthesizer model |
+| `explorer_model` | `deepseek-v4-flash` | explore-phase model |
+| `system_prompt` | configured default | synthesizer's system prompt for this call |
+| `explorer_system_prompt` | built-in explorer prompt | explorer's system prompt for this call |
+| `disable_explore` | `false` | skip the explore phase entirely for this call |
+| `thinking` | `true` | V4 thinking mode on the synth call; set `false` for fast non-thinking responses. The explorer phase never uses thinking regardless of this setting. |
+
+If you want a stateful conversation without the explore phase, set
+`disable_explore: true` per call. If you want a stateless, direct call,
+use `consult_deepseek_oneshot` instead.
+
+### Exploration tools
+
+When `--root` points at a project (default: CWD) and `--no-explore` is
+not set, the explorer phase gets three function-calling tools:
 
 - `list_directory(path)` — list entries under a directory, sorted alphabetically with sizes
 - `read_file(path)` — read a file (capped at 100 KiB; `.git`, `node_modules`, `vendor` skipped)
@@ -30,7 +74,7 @@ can inspect the codebase on its own during reasoning:
 
 All paths are resolved relative to `--root` and validated against `..`
 traversal and symlink escapes. The loop caps at 10 tool iterations per
-turn.
+explore phase.
 
 ## Resources
 

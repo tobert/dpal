@@ -97,7 +97,10 @@ func run(args []string, getenv func(string) string) error {
 	}
 
 	client := deepseek.NewClient(apiKey)
-	srv := server.New(client).WithVersion(version).WithSystemPrompt(sysPrompt)
+	srv := server.New(client).
+		WithVersion(version).
+		WithSystemPrompt(sysPrompt).
+		WithExplorerSystemPrompt(defaultExplorerSystemPrompt)
 
 	if !*noExploreFlag {
 		exp, expErr := explorer.New(*rootFlag)

@@ -49,7 +49,7 @@ func TestConsultOneshot_SurfacesBothChannels(t *testing.T) {
 	}
 }
 
-func TestConsultOneshot_DefaultsToReasoner(t *testing.T) {
+func TestConsultOneshot_DefaultsToV4Pro(t *testing.T) {
 	fake := &fakeClient{resp: makeResp("ok", "")}
 	s := New(fake)
 
@@ -57,11 +57,14 @@ func TestConsultOneshot_DefaultsToReasoner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if fake.lastReq.Model != deepseek.DeepSeekReasoner {
-		t.Errorf("request model = %q, want %q", fake.lastReq.Model, deepseek.DeepSeekReasoner)
+	if fake.lastReq.Model != ModelV4Pro {
+		t.Errorf("request model = %q, want %q", fake.lastReq.Model, ModelV4Pro)
 	}
-	if out.Model != deepseek.DeepSeekReasoner {
-		t.Errorf("output model = %q, want %q", out.Model, deepseek.DeepSeekReasoner)
+	if out.Model != ModelV4Pro {
+		t.Errorf("output model = %q, want %q", out.Model, ModelV4Pro)
+	}
+	if !fake.lastReq.EnableThinking {
+		t.Errorf("EnableThinking = false, want true (V4-Pro defaults to thinking mode)")
 	}
 }
 

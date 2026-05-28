@@ -1,7 +1,8 @@
 // Package explorer provides sandboxed read-only filesystem tools that
-// dpal exposes to DeepSeek-R1 via function calling so the model can
-// inspect a project root on its own. All paths are resolved relative
-// to a configured root and validated against escape attempts.
+// dpal exposes to DeepSeek V4 via function calling so the model can
+// inspect a project root on its own. Primarily driven by the explorer
+// phase of consult_deepseek's two-phase flow. All paths are resolved
+// relative to a configured root and validated against escape attempts.
 package explorer
 
 import (

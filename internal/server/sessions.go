@@ -8,9 +8,12 @@ import (
 
 const defaultMaxSessions = 100
 
-// ReasoningEntry is one R1 reasoning_content payload captured at a
-// specific turn. Stored parallel to Session.messages — never replayed
-// to the model, but kept for display via dpal://session/{id}.
+// ReasoningEntry is one thinking-mode reasoning_content payload
+// captured at a specific turn. Stored parallel to Session.messages for
+// display via dpal://session/{id}. NOTE: this array now duplicates the
+// ReasoningContent field already present on Session.messages assistant
+// entries (V4 requires replay; see CLAUDE.md). Tracked for refactor in
+// docs/issues.md — kept for now so the resource handler stays simple.
 type ReasoningEntry struct {
 	TurnIndex int    `json:"turn_index"` // 1-based user-turn index this reasoning answered
 	Content   string `json:"content"`
@@ -169,8 +172,8 @@ func (s *Sessions) Transcript(id string) ([]TranscriptMessage, bool) {
 }
 
 // Reasoning returns a deep copy of the per-turn reasoning log for id.
-// Empty slice (not nil) when the session exists but has no R1 turns
-// recorded; (nil, false) when no such session exists.
+// Empty slice (not nil) when the session exists but has no thinking-mode
+// turns recorded; (nil, false) when no such session exists.
 func (s *Sessions) Reasoning(id string) ([]ReasoningEntry, bool) {
 	s.mu.Lock()
 	sess, ok := s.byID[id]

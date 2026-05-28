@@ -67,13 +67,13 @@ func TestOneshot_EmitsSpanWithGenAIAttributes(t *testing.T) {
 
 	attrs := attrIndex(span)
 	want := map[string]any{
-		"gen_ai.system":                 "deepseek",
-		"gen_ai.operation.name":         "chat",
-		"gen_ai.request.model":          deepseek.DeepSeekReasoner,
-		"gen_ai.request.message_count":  int64(1),
-		"gen_ai.response.model":         "deepseek-reasoner",
-		"gen_ai.usage.input_tokens":     int64(12),
-		"gen_ai.usage.output_tokens":    int64(7),
+		"gen_ai.system":                    "deepseek",
+		"gen_ai.operation.name":            "chat",
+		"gen_ai.request.model":             ModelV4Pro,
+		"gen_ai.request.message_count":     int64(1),
+		"gen_ai.response.model":            "deepseek-reasoner",
+		"gen_ai.usage.input_tokens":        int64(12),
+		"gen_ai.usage.output_tokens":       int64(7),
 		"deepseek.usage.cache_hit_tokens":  int64(4),
 		"deepseek.usage.cache_miss_tokens": int64(8),
 	}

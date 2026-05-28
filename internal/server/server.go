@@ -25,6 +25,18 @@ import (
 
 const defaultMaxToolIterations = 10
 
+// V4 model IDs. deepseek-go v1.3.4 only exposes the legacy DeepSeekChat
+// ("deepseek-chat") and DeepSeekReasoner ("deepseek-reasoner") aliases.
+// Those aliases route to deepseek-v4-flash (non-thinking/thinking
+// respectively) today, but DeepSeek announced they will be retired on
+// 2026-07-24. dpal addresses V4 models by explicit ID so it survives
+// the alias retirement, and so we can pick V4-Pro (the strong reasoner)
+// for synthesis instead of V4-Flash with thinking.
+const (
+	ModelV4Pro   = "deepseek-v4-pro"
+	ModelV4Flash = "deepseek-v4-flash"
+)
+
 // Retry policy for transient upstream failures (429 + 5xx). Exponential
 // backoff with jitter, bounded total attempts. Per-call only — the
 // tool-call loop is not retried as a unit; each upstream HTTP request
@@ -42,14 +54,16 @@ type DeepSeekClient interface {
 }
 
 type Server struct {
-	client            DeepSeekClient
-	defaultModel      string
-	sessions          *Sessions
-	tracer            trace.Tracer
-	version           string
-	explorer          *explorer.Explorer
-	maxToolIterations int
-	systemPrompt      string // composed at startup; per-call SystemPrompt overrides
+	client                 DeepSeekClient
+	defaultModel           string
+	defaultExplorerModel   string // model used for the explore phase of two-phase Consult
+	sessions               *Sessions
+	tracer                 trace.Tracer
+	version                string
+	explorer               *explorer.Explorer
+	maxToolIterations      int
+	systemPrompt           string // composed at startup; per-call SystemPrompt overrides
+	explorerSystemPrompt   string // system prompt used during the explore phase
 
 	retryMax      int
 	retryBaseWait time.Duration
@@ -72,16 +86,17 @@ type ModelUsage struct {
 
 func New(client DeepSeekClient) *Server {
 	return &Server{
-		client:            client,
-		defaultModel:      deepseek.DeepSeekReasoner,
-		sessions:          NewSessions(defaultMaxSessions),
-		tracer:            otel.Tracer("dpal"),
-		version:           "unknown",
-		maxToolIterations: defaultMaxToolIterations,
-		retryMax:          defaultRetryMax,
-		retryBaseWait:     defaultRetryBaseWait,
-		retryMaxWait:      defaultRetryMaxWait,
-		usage:             make(map[string]*ModelUsage),
+		client:               client,
+		defaultModel:         ModelV4Pro,
+		defaultExplorerModel: ModelV4Flash,
+		sessions:             NewSessions(defaultMaxSessions),
+		tracer:               otel.Tracer("dpal"),
+		version:              "unknown",
+		maxToolIterations:    defaultMaxToolIterations,
+		retryMax:             defaultRetryMax,
+		retryBaseWait:        defaultRetryBaseWait,
+		retryMaxWait:         defaultRetryMaxWait,
+		usage:                make(map[string]*ModelUsage),
 	}
 }
 
@@ -119,6 +134,16 @@ func (s *Server) WithSystemPrompt(p string) *Server {
 	return s
 }
 
+// WithExplorerSystemPrompt installs the system prompt used during the
+// explore phase of two-phase Consult. Per-call ExplorerSystemPrompt on
+// ConsultInput overrides this for a single call. Empty string means no
+// dedicated explorer prompt — the synthesizer's system prompt is used
+// for the explore phase as a fallback.
+func (s *Server) WithExplorerSystemPrompt(p string) *Server {
+	s.explorerSystemPrompt = p
+	return s
+}
+
 // chat orchestrates one or more DeepSeek calls, dispatching any tool
 // calls the model requests through the configured Explorer until the
 // model returns a final answer (FinishReason != "tool_calls") or the
@@ -137,6 +162,7 @@ func (s *Server) chat(
 	systemPrompt string,
 	exp *explorer.Explorer,
 	messages []deepseek.ChatCompletionMessage,
+	enableThinking bool,
 ) (*deepseek.ChatCompletionResponse, []deepseek.ChatCompletionMessage, error) {
 	msgs := make([]deepseek.ChatCompletionMessage, len(messages))
 	copy(msgs, messages)
@@ -152,7 +178,7 @@ func (s *Server) chat(
 	}
 
 	for iter := 0; iter < maxIter; iter++ {
-		resp, err := s.callOnce(ctx, model, systemPrompt, msgs, tools, iter)
+		resp, err := s.callOnce(ctx, model, systemPrompt, msgs, tools, iter, enableThinking)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -163,11 +189,14 @@ func (s *Server) chat(
 
 		hasToolCalls := len(choice.Message.ToolCalls) > 0
 		if !hasToolCalls {
-			// Final answer. Append assistant content (no reasoning) to
-			// the durable history and return.
+			// Final answer. Append assistant content to the durable
+			// history. ReasoningContent is preserved per V4's
+			// multi-turn-with-tools requirement (V3/R1 used to require
+			// the opposite — see CLAUDE.md).
 			msgs = append(msgs, deepseek.ChatCompletionMessage{
-				Role:    deepseek.ChatMessageRoleAssistant,
-				Content: choice.Message.Content,
+				Role:             deepseek.ChatMessageRoleAssistant,
+				Content:          choice.Message.Content,
+				ReasoningContent: choice.Message.ReasoningContent,
 			})
 			return resp, msgs, nil
 		}
@@ -177,10 +206,14 @@ func (s *Server) chat(
 		}
 
 		// Record the assistant turn that carries the tool calls.
+		// ReasoningContent is preserved here too: if a thinking-enabled
+		// model emits reasoning_content alongside tool_calls, V4
+		// requires it on subsequent requests.
 		msgs = append(msgs, deepseek.ChatCompletionMessage{
-			Role:      deepseek.ChatMessageRoleAssistant,
-			Content:   choice.Message.Content,
-			ToolCalls: choice.Message.ToolCalls,
+			Role:             deepseek.ChatMessageRoleAssistant,
+			Content:          choice.Message.Content,
+			ReasoningContent: choice.Message.ReasoningContent,
+			ToolCalls:        choice.Message.ToolCalls,
 		})
 
 		// Dispatch each tool call and append its result.
@@ -207,6 +240,7 @@ func (s *Server) callOnce(
 	messages []deepseek.ChatCompletionMessage,
 	tools []deepseek.Tool,
 	iter int,
+	enableThinking bool,
 ) (*deepseek.ChatCompletionResponse, error) {
 	var lastErr error
 	for attempt := 0; attempt <= s.retryMax; attempt++ {
@@ -218,7 +252,7 @@ func (s *Server) callOnce(
 				return nil, ctx.Err()
 			}
 		}
-		resp, err := s.callAttempt(ctx, model, systemPrompt, messages, tools, iter, attempt)
+		resp, err := s.callAttempt(ctx, model, systemPrompt, messages, tools, iter, attempt, enableThinking)
 		if err == nil {
 			return resp, nil
 		}
@@ -265,6 +299,7 @@ func (s *Server) callAttempt(
 	tools []deepseek.Tool,
 	iter int,
 	attempt int,
+	enableThinking bool,
 ) (*deepseek.ChatCompletionResponse, error) {
 	outbound := messages
 	if systemPrompt != "" {
@@ -286,13 +321,15 @@ func (s *Server) callAttempt(
 			attribute.Int("dpal.tools_offered", len(tools)),
 			attribute.Int("dpal.retry_attempt", attempt),
 			attribute.Bool("dpal.system_prompt_present", systemPrompt != ""),
+			attribute.Bool("dpal.thinking_enabled", enableThinking),
 		),
 	)
 	defer span.End()
 
 	req := &deepseek.ChatCompletionRequest{
-		Model:    model,
-		Messages: outbound,
+		Model:          model,
+		Messages:       outbound,
+		EnableThinking: enableThinking,
 	}
 	if len(tools) > 0 {
 		req.Tools = tools
@@ -440,8 +477,9 @@ func fileURIToPath(uri string) (string, error) {
 
 type OneshotInput struct {
 	Prompt       string `json:"prompt" jsonschema:"the question or instruction to send to DeepSeek"`
-	Model        string `json:"model,omitempty" jsonschema:"optional model override; defaults to deepseek-reasoner"`
+	Model        string `json:"model,omitempty" jsonschema:"optional model override; defaults to deepseek-v4-pro"`
 	SystemPrompt string `json:"system_prompt,omitempty" jsonschema:"optional system prompt override for this call; takes precedence over the dpal-configured default"`
+	Thinking     *bool  `json:"thinking,omitempty" jsonschema:"optional override for V4 thinking mode; defaults to true (V4-Pro is a thinking-mode model). Set false to get fast non-thinking responses."`
 }
 
 type OneshotOutput struct {
@@ -450,6 +488,12 @@ type OneshotOutput struct {
 	Model            string `json:"model"`
 }
 
+// ConsultOneshot is the non-agentic, single-call, stateless tool. It
+// makes exactly one DeepSeek request — no tools are advertised and no
+// explore phase runs, so the caller is responsible for providing all
+// the context the model needs in the prompt. Mirrors gpal's batch-style
+// call. Use Consult instead when you want dpal's two-phase agentic
+// default.
 func (s *Server) ConsultOneshot(
 	ctx context.Context,
 	req *mcp.CallToolRequest,
@@ -469,11 +513,17 @@ func (s *Server) ConsultOneshot(
 		sysPrompt = in.SystemPrompt
 	}
 
-	exp := s.explorerForRequest(ctx, req)
+	// V4 thinking mode: default on for the oneshot path since the
+	// default model is V4-Pro (a thinking-mode model). Callers can
+	// flip this off when they pick a non-thinking model.
+	enableThinking := true
+	if in.Thinking != nil {
+		enableThinking = *in.Thinking
+	}
 
-	resp, _, err := s.chat(ctx, model, sysPrompt, exp, []deepseek.ChatCompletionMessage{
+	resp, _, err := s.chat(ctx, model, sysPrompt, nil, []deepseek.ChatCompletionMessage{
 		{Role: deepseek.ChatMessageRoleUser, Content: in.Prompt},
-	})
+	}, enableThinking)
 	if err != nil {
 		return nil, OneshotOutput{}, fmt.Errorf("deepseek call failed: %w", err)
 	}
@@ -494,24 +544,38 @@ func (s *Server) ConsultOneshot(
 }
 
 type ConsultInput struct {
-	SessionID    string `json:"session_id" jsonschema:"identifier for this conversation; reuse to continue, choose any new string to start fresh"`
-	Prompt       string `json:"prompt" jsonschema:"the user message to send"`
-	Model        string `json:"model,omitempty" jsonschema:"optional model override; defaults to deepseek-reasoner"`
-	SystemPrompt string `json:"system_prompt,omitempty" jsonschema:"optional system prompt override for this call; takes precedence over the dpal-configured default. Not stored in session history, so changing it between calls is safe."`
+	SessionID            string `json:"session_id" jsonschema:"identifier for this conversation; reuse to continue, choose any new string to start fresh"`
+	Prompt               string `json:"prompt" jsonschema:"the user message to send"`
+	Model                string `json:"model,omitempty" jsonschema:"optional synthesizer model override; defaults to deepseek-v4-pro. This is the model that writes the final answer."`
+	SystemPrompt         string `json:"system_prompt,omitempty" jsonschema:"optional system prompt override for this call; takes precedence over the dpal-configured default. Not stored in session history, so changing it between calls is safe."`
+	ExplorerModel        string `json:"explorer_model,omitempty" jsonschema:"optional explore-phase model override; defaults to deepseek-v4-flash. Used only when an explorer is configured (i.e. not --no-explore)."`
+	ExplorerSystemPrompt string `json:"explorer_system_prompt,omitempty" jsonschema:"optional system prompt override for the explore phase; takes precedence over the dpal-configured explorer default."`
+	DisableExplore       bool   `json:"disable_explore,omitempty" jsonschema:"set true to skip the explore phase for this call and send the prompt directly to the synthesizer model. Useful when the caller has already curated context."`
+	Thinking             *bool  `json:"thinking,omitempty" jsonschema:"optional override for V4 thinking mode on the synthesizer call; defaults to true. Set false for fast non-thinking synthesis. The explorer phase never uses thinking mode regardless of this setting."`
 }
 
 type ConsultOutput struct {
-	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
-	Model            string `json:"model"`
-	SessionID        string `json:"session_id"`
-	TurnCount        int    `json:"turn_count"`
+	Content           string `json:"content"`
+	ReasoningContent  string `json:"reasoning_content,omitempty"`
+	Model             string `json:"model"`
+	ExplorerModel     string `json:"explorer_model,omitempty"` // empty when the explore phase did not run
+	ExplorerToolCalls int    `json:"explorer_tool_calls"`      // number of tool calls the explorer issued
+	SessionID         string `json:"session_id"`
+	TurnCount         int    `json:"turn_count"`
 }
 
-// Consult is the stateful chat tool. It appends the user prompt to the
-// session's history, calls DeepSeek with the full transcript, then appends
-// the assistant reply (content only — reasoning_content is intentionally
-// excluded from subsequent requests per DeepSeek's guidance).
+// Consult is the stateful, agentic chat tool. By default it runs two
+// phases: a cheap explorer model (deepseek-v4-flash, non-thinking)
+// drives the tool loop to load relevant code and context, then a
+// stronger synthesizer model (deepseek-v4-pro, thinking) takes the
+// loaded message history and writes the final answer. The explorer's
+// own text-only synthesis attempt is stripped before the synthesizer
+// is called so the synthesizer doesn't just defer to it.
+//
+// If --no-explore is set or DisableExplore is true on the input, the
+// explore phase is skipped and the synthesizer is called directly.
+// Errors during either phase abort the whole call and leave the
+// session's durable history untouched.
 func (s *Server) Consult(
 	ctx context.Context,
 	req *mcp.CallToolRequest,
@@ -524,9 +588,14 @@ func (s *Server) Consult(
 		return nil, ConsultOutput{}, fmt.Errorf("prompt is required")
 	}
 
-	model := in.Model
-	if model == "" {
-		model = s.defaultModel
+	synthModel := in.Model
+	if synthModel == "" {
+		synthModel = s.defaultModel
+	}
+
+	explorerModel := in.ExplorerModel
+	if explorerModel == "" {
+		explorerModel = s.defaultExplorerModel
 	}
 
 	sess := s.sessions.Acquire(in.SessionID)
@@ -543,16 +612,59 @@ func (s *Server) Consult(
 		Content: in.Prompt,
 	})
 
-	sysPrompt := s.systemPrompt
+	synthSysPrompt := s.systemPrompt
 	if in.SystemPrompt != "" {
-		sysPrompt = in.SystemPrompt
+		synthSysPrompt = in.SystemPrompt
 	}
 
 	exp := s.explorerForRequest(ctx, req)
 
-	resp, updated, err := s.chat(ctx, model, sysPrompt, exp, candidate)
+	// Phase 1: explore. Skipped if there's no explorer (--no-explore) or
+	// the caller opted out. The explorer's tool exchanges land in
+	// `candidate` for the synthesizer to read; the explorer's own final
+	// text answer is dropped so the synthesizer doesn't anchor on it.
+	//
+	// The explorer never uses V4 thinking mode — exploration is
+	// pattern-match-and-load, not deep reasoning, and thinking-mode
+	// tokens on the explorer would be wasted spend.
+	var explorerToolCalls int
+	usedExplorer := ""
+	if exp != nil && !in.DisableExplore {
+		explorerSys := s.explorerSystemPrompt
+		if in.ExplorerSystemPrompt != "" {
+			explorerSys = in.ExplorerSystemPrompt
+		}
+		if explorerSys == "" {
+			// Fall back to synthesizer's system prompt if no explorer
+			// prompt is configured. Better than sending no system
+			// message at all for the explore phase.
+			explorerSys = synthSysPrompt
+		}
+
+		_, withExploration, err := s.chat(ctx, explorerModel, explorerSys, exp, candidate, false)
+		if err != nil {
+			return nil, ConsultOutput{}, fmt.Errorf("deepseek explore phase failed: %w", err)
+		}
+
+		candidate, explorerToolCalls = stripExplorerSynthesis(withExploration, len(candidate))
+		usedExplorer = explorerModel
+	}
+
+	// V4 thinking mode for the synth call: on by default (the default
+	// model is V4-Pro, which exists precisely to do thinking-mode
+	// synthesis). Callers can flip it off when they explicitly pick a
+	// non-thinking model and want fast responses.
+	enableThinking := true
+	if in.Thinking != nil {
+		enableThinking = *in.Thinking
+	}
+
+	// Phase 2: synthesize. No tools advertised — the synthesizer reads
+	// whatever the explorer loaded into the candidate transcript and
+	// writes a final answer.
+	resp, updated, err := s.chat(ctx, synthModel, synthSysPrompt, nil, candidate, enableThinking)
 	if err != nil {
-		return nil, ConsultOutput{}, fmt.Errorf("deepseek call failed: %w", err)
+		return nil, ConsultOutput{}, fmt.Errorf("deepseek synthesize phase failed: %w", err)
 	}
 	if len(resp.Choices) == 0 {
 		return nil, ConsultOutput{}, fmt.Errorf("deepseek returned no choices")
@@ -576,11 +688,13 @@ func (s *Server) Consult(
 	}
 
 	out := ConsultOutput{
-		Content:          msg.Content,
-		ReasoningContent: msg.ReasoningContent,
-		Model:            model,
-		SessionID:        in.SessionID,
-		TurnCount:        turnCount,
+		Content:           msg.Content,
+		ReasoningContent:  msg.ReasoningContent,
+		Model:             synthModel,
+		ExplorerModel:     usedExplorer,
+		ExplorerToolCalls: explorerToolCalls,
+		SessionID:         in.SessionID,
+		TurnCount:         turnCount,
 	}
 
 	return &mcp.CallToolResult{
@@ -588,14 +702,49 @@ func (s *Server) Consult(
 	}, out, nil
 }
 
+// stripExplorerSynthesis drops the explorer's final text-only assistant
+// message (which is its attempt at answering — we want the synthesizer
+// to write the answer instead) while keeping every tool_call/tool pair
+// the explorer issued. originalLen is the length of the candidate
+// before the explorer ran; messages at that index or later are
+// explorer-produced and subject to stripping.
+//
+// Also returns the count of tool calls the explorer made, summed across
+// all of its assistant turns.
+func stripExplorerSynthesis(msgs []deepseek.ChatCompletionMessage, originalLen int) ([]deepseek.ChatCompletionMessage, int) {
+	toolCalls := 0
+	for i := originalLen; i < len(msgs); i++ {
+		if msgs[i].Role == deepseek.ChatMessageRoleAssistant {
+			toolCalls += len(msgs[i].ToolCalls)
+		}
+	}
+	// chat() always appends a final text-only assistant message when
+	// the loop terminates normally (FinishReason != tool_calls). Strip
+	// it. Defensive: only strip if it actually matches that shape.
+	if n := len(msgs); n > 0 {
+		last := msgs[n-1]
+		if last.Role == deepseek.ChatMessageRoleAssistant && len(last.ToolCalls) == 0 {
+			return msgs[:n-1], toolCalls
+		}
+	}
+	return msgs, toolCalls
+}
+
 func (s *Server) Register(mcpServer *mcp.Server) {
 	mcp.AddTool(mcpServer, &mcp.Tool{
-		Name:        "consult_deepseek_oneshot",
-		Description: "Send a single stateless prompt to DeepSeek and return the answer plus the model's reasoning_content (for R1).",
+		Name: "consult_deepseek_oneshot",
+		Description: "Single stateless DeepSeek call — no session, no tools, no exploration. " +
+			"Exactly one upstream request: your prompt in, model's answer out. " +
+			"You are responsible for any context the model needs. " +
+			"Use consult_deepseek instead for dpal's agentic two-phase default.",
 	}, s.ConsultOneshot)
 	mcp.AddTool(mcpServer, &mcp.Tool{
-		Name:        "consult_deepseek",
-		Description: "Send a prompt to DeepSeek in a stateful conversation keyed by session_id. Subsequent calls with the same session_id continue the conversation.",
+		Name: "consult_deepseek",
+		Description: "Agentic, stateful DeepSeek V4 consultation. Two phases by default: " +
+			"a cheap explorer model (deepseek-v4-flash, non-thinking) reads files via tool calls to load context, " +
+			"then a stronger synthesizer model (deepseek-v4-pro with thinking) writes the answer. " +
+			"BOTH MODELS ARE BILLED. Conversation is keyed by session_id; reuse to continue. " +
+			"Set disable_explore=true to skip the explore phase, or use consult_deepseek_oneshot for a single direct call.",
 	}, s.Consult)
 
 	mcpServer.AddResource(&mcp.Resource{

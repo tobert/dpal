@@ -27,8 +27,8 @@ func TestInfoJSON_ReflectsServerState(t *testing.T) {
 	if got.Version != "9.9.9" {
 		t.Errorf("version = %q, want 9.9.9", got.Version)
 	}
-	if got.DefaultModel != deepseek.DeepSeekReasoner {
-		t.Errorf("default_model = %q, want %q", got.DefaultModel, deepseek.DeepSeekReasoner)
+	if got.DefaultModel != ModelV4Pro {
+		t.Errorf("default_model = %q, want %q", got.DefaultModel, ModelV4Pro)
 	}
 	if got.SessionCap != defaultMaxSessions {
 		t.Errorf("session_cap = %d, want %d", got.SessionCap, defaultMaxSessions)
