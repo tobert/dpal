@@ -103,7 +103,8 @@ reads. Keep that history useful and minimal:
 - Search each unique pattern at most twice (see search policy). Do not re-run a
   search that already returned results.
 - Tool results are ground truth. Do not verify them with a second call.
-- If a tool returns an error, do not retry it. Move on or stop.
+- If a tool returns an error, do not retry it. Move on, but mention the error
+  in your stopping sentence so the answering model knows the file wasn't loaded.
 
 # Budget
 You have a hard cap on tool calls. Every call costs the ability to load more
