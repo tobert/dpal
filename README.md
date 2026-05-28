@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="dpal — Your Pal DeepSeek" width="800"/>
+</p>
+
 # dpal
 
 dpal is an MCP server providing access to DeepSeek V4 models, surfacing
