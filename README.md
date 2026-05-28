@@ -73,8 +73,8 @@ When `--root` points at a project (default: CWD) and `--no-explore` is
 not set, the explorer phase gets three function-calling tools:
 
 - `list_directory(path)` — list entries under a directory, sorted alphabetically with sizes
-- `read_file(path)` — read a file (capped at 100 KiB; `.git`, `node_modules`, `vendor` skipped)
-- `search_project(pattern, glob)` — RE2 regex search across files, optional basename glob
+- `read_file(path)` — read a file (capped at 100 KiB; truncated with a trailing marker if larger)
+- `search_project(pattern, glob)` — RE2 regex search across files, optional basename glob; skips `.git`, `node_modules`, `vendor`
 
 All paths are resolved relative to `--root` and validated against `..`
 traversal and symlink escapes. The loop caps at 10 tool iterations per
