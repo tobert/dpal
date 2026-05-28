@@ -7,9 +7,9 @@
 dpal is an MCP server providing access to DeepSeek V4 models, surfacing
 thinking-mode reasoning as a separate output channel.
 
-Sibling of [gpal](https://github.com/tobert/gpal) (Gemini) and cpal (Claude),
-implemented in Go on top of the official
-[modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk).
+Sibling of [gpal](https://github.com/tobert/gpal) (Gemini) and
+[cpal](https://github.com/tobert/cpal) (Claude), implemented in Go on top of the
+official [modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk).
 
 ## Tools
 
@@ -67,6 +67,12 @@ If you want a stateful conversation without the explore phase, set
 `disable_explore: true` per call. If you want a stateless, direct call,
 use `consult_deepseek_oneshot` instead.
 
+dpal ships with built-in system prompts tuned for V4-Pro (synthesizer) and
+V4-Flash (explorer); the rationale and tuning history live in
+[`docs/system-prompts.md`](docs/system-prompts.md). `--no-default-prompt`
+suppresses the synthesizer default; `--system-prompt FILE` appends extra
+instructions on top.
+
 ### Exploration tools
 
 When `--root` points at a project (default: CWD) and `--no-explore` is
@@ -78,7 +84,9 @@ not set, the explorer phase gets three function-calling tools:
 
 All paths are resolved relative to `--root` and validated against `..`
 traversal and symlink escapes. The loop caps at 10 tool iterations per
-explore phase.
+explore phase. `--root` and `--no-explore` are set on dpal's command
+line — see "Install into Claude Code" below for the typical `claude mcp
+add` pattern.
 
 ## Resources
 
