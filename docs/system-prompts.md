@@ -53,6 +53,33 @@ Preserve these unless a future round of testing falsifies them:
   thinking-mode section names what belongs in reasoning ("weighing
   interpretations, tracing logic paths, verifying consistency") rather
   than relying on the model to infer the boundary.
+- **Rules that could conflict should read as routing, not competition.**
+  "Trust the framing" and "push back when ambiguous" used to live in
+  separate bullets and silently competed for primacy. They now share one
+  conditional bullet (*when clear, trust; when ambiguous, push back*) so
+  the model has one routing rule instead of two imperatives.
+- **Scope time-bounded rules to the window they cover.** "Make one
+  focused attempt and stop" is about within-call efficiency, not
+  shipping mediocrity across sessions. Without "per response" /
+  "within a single answer" qualifiers it can read as anti-improvement.
+- **Surface errors in terminators, not silently past them.** The
+  explorer's tool errors were always recorded in the conversation
+  history, but a "move on or stop" instruction risked the synthesizer
+  treating them as non-events. Requiring acknowledgment in the stopping
+  sentence gives the synth a bright signal that a file is missing.
+- **Permit out-of-scope flagging at the tail.** A "concise over
+  exhaustive" instruction will suppress adjacent-issue observations the
+  calling agent would want. One bullet permitting (not mandating) an
+  end-of-response flag preserves the signal without inviting tangents.
+- **Use the calling agent's vocabulary where it has one.** The synth
+  prompt says "contributing factors rather than a single root cause"
+  because that's the framing the calling agent uses to parse debugging
+  responses. A one-line vocabulary cue beats a methodology lecture.
+- **Don't add directives outside the model's actual scope.** TDD lives
+  between the calling agent and the user; the synthesizer doesn't run
+  tests. Forcing TDD framing into the prompt would invite the model to
+  write test files unprompted. The prompt covers what the model does,
+  not what the surrounding system does.
 
 ## Running another tuning round
 
@@ -67,10 +94,15 @@ When the prompts feel stale or a real-world failure mode shows up:
    before any text changes.
 4. Push back where the diagnostic feels off. The model is being asked
    to critique a prompt it's running under; deference is a real risk.
-5. Only then ask for drafts. Feed any observed failure (e.g., this
-   round's misfired tool call) back as ground truth — "this happened,
-   account for it."
-6. Ship as separate commits, one per prompt, with Pro co-authored.
+5. Only then ask for drafts. Feed any observed failure (e.g., the
+   first round's misfired tool call) back as ground truth — "this
+   happened, account for it."
+6. If the round is about *collaboration norms* (kaizen, push-back,
+   silent-fallback aversion, etc.) rather than failure modes, paste
+   the relevant rubric verbatim and ask Pro to find places where the
+   current wording quietly works against it. Pro is good at this when
+   given a concrete external standard to match against.
+7. Ship as separate commits, one per prompt, with Pro co-authored.
 
 If a future round changes a prompt in a way that contradicts one of
 the principles above, update this file in the same commit. The
