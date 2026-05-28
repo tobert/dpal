@@ -319,7 +319,7 @@ func (e *Explorer) ToolDefinitions() []deepseek.Tool {
 			Type: "function",
 			Function: deepseek.Function{
 				Name:        "search_project",
-				Description: "Search for lines matching a Go regexp across files under the project root. Returns matches grouped by file with line numbers.",
+				Description: "Search for lines matching a Go regexp across files under the project root. Returns matches grouped by file with line numbers. Skips .git, node_modules, and vendor directories.",
 				Parameters: &deepseek.FunctionParameters{
 					Type: "object",
 					Properties: map[string]any{
