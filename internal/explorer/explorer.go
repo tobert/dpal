@@ -243,8 +243,7 @@ func (e *Explorer) SearchProject(pattern, glob string) (string, error) {
 			return nil
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if name == ".git" || name == "node_modules" || name == "vendor" {
+			if defaultTreeSkipDirs[d.Name()] {
 				return filepath.SkipDir
 			}
 			return nil
@@ -440,7 +439,7 @@ func (e *Explorer) ToolDefinitions() []deepseek.Tool {
 			Type: "function",
 			Function: deepseek.Function{
 				Name:        "search_project",
-				Description: "Search for lines matching a Go regexp across files under the project root. Returns matches grouped by file with line numbers. Skips .git, node_modules, and vendor directories.",
+				Description: "Search for lines matching a Go regexp across files under the project root. Returns matches grouped by file with line numbers. Skips dependency/build dirs (.git, node_modules, vendor, target, __pycache__, etc.).",
 				Parameters: &deepseek.FunctionParameters{
 					Type: "object",
 					Properties: map[string]any{

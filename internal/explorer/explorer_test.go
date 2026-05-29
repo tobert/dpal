@@ -234,6 +234,31 @@ func TestSearchProject_SkipsGitDir(t *testing.T) {
 	}
 }
 
+// search_project must prune the same dependency/build dirs as project_tree,
+// not just .git — otherwise it walks a Rust target/ or a node_modules and
+// burns explorer iterations on build artifacts.
+func TestSearchProject_SkipsBuildAndDependencyDirs(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	for _, d := range []string{"node_modules", "vendor", "target", "__pycache__"} {
+		mkdir(t, dir, d)
+		writeFile(t, dir, filepath.Join(d, "junk.txt"), "MATCHME")
+	}
+	writeFile(t, dir, "src.go", "// MATCHME\n")
+
+	out, err := exp.SearchProject("MATCHME", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, gone := range []string{"node_modules", "vendor", "target", "__pycache__", "junk.txt"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("skip-set dir %q leaked into search results:\n%s", gone, out)
+		}
+	}
+	if !strings.Contains(out, "src.go") {
+		t.Errorf("real source not searched:\n%s", out)
+	}
+}
+
 func TestSearchProject_ReportsUnreadableFiles(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("permission semantics differ on Windows")
