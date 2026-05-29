@@ -20,19 +20,19 @@ import (
 )
 
 const (
-	defaultMaxFileBytes  int64 = 100 * 1024 // 100 KiB cap on read_file
-	defaultMaxSearchHits       = 200
-	defaultMaxListEntries      = 1000
+	defaultMaxFileBytes   int64 = 100 * 1024 // 100 KiB cap on read_file
+	defaultMaxSearchHits        = 200
+	defaultMaxListEntries       = 1000
 	defaultMaxSearchBytes int64 = 512 * 1024 // skip files larger than this in search
 )
 
 // Explorer is the sandbox + dispatcher for the project-inspection tools.
 type Explorer struct {
-	root            string // absolute, cleaned, symlinks resolved
-	maxFileBytes    int64
-	maxSearchHits   int
-	maxListEntries  int
-	maxSearchBytes  int64
+	root           string // absolute, cleaned, symlinks resolved
+	maxFileBytes   int64
+	maxSearchHits  int
+	maxListEntries int
+	maxSearchBytes int64
 }
 
 // New constructs an Explorer rooted at root. The path is made absolute

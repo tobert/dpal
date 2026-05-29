@@ -156,7 +156,7 @@ func resolveOTelEndpoint(fromFlag, fromFile string, getenv func(string) string) 
 
 // resolveAPIKey applies the precedence rule:
 //
-//   --api-key  XOR  --api-key-file  ->  DEEPSEEK_API_KEY
+//	--api-key  XOR  --api-key-file  ->  DEEPSEEK_API_KEY
 //
 // Both flags together is an error so the caller's intent isn't
 // ambiguous. The file path is read fresh on every startup and trimmed

@@ -95,10 +95,10 @@ func TestSessions_ZeroMaxDisablesCap(t *testing.T) {
 // Eviction is active: cap << goroutine count, so the LRU path is exercised.
 func TestSessions_ConcurrentAccess(t *testing.T) {
 	const (
-		goroutines    = 32
-		opsPerWorker  = 200
-		sessionPool   = 16 // distinct IDs cycled through
-		capacity      = 4  // forces frequent eviction
+		goroutines   = 32
+		opsPerWorker = 200
+		sessionPool  = 16 // distinct IDs cycled through
+		capacity     = 4  // forces frequent eviction
 	)
 
 	s := NewSessions(capacity)

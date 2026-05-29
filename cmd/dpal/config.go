@@ -66,10 +66,10 @@ func loadConfig(explicit string, getenv func(string) string) Config {
 }
 
 // composeSystemPrompt layers the prompt sources in fixed order:
-//   1. Built-in default (unless suppressed)
-//   2. Config inline system_prompt
-//   3. Config system_prompts files
-//   4. CLI --system-prompt files
+//  1. Built-in default (unless suppressed)
+//  2. Config inline system_prompt
+//  3. Config system_prompts files
+//  4. CLI --system-prompt files
 //
 // noDefault wins over the config's include_default_prompt setting.
 // Empty result means no system message will be sent.

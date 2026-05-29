@@ -54,16 +54,16 @@ type DeepSeekClient interface {
 }
 
 type Server struct {
-	client                 DeepSeekClient
-	defaultModel           string
-	defaultExplorerModel   string // model used for the explore phase of two-phase Consult
-	sessions               *Sessions
-	tracer                 trace.Tracer
-	version                string
-	explorer               *explorer.Explorer
-	maxToolIterations      int
-	systemPrompt           string // composed at startup; per-call SystemPrompt overrides
-	explorerSystemPrompt   string // system prompt used during the explore phase
+	client               DeepSeekClient
+	defaultModel         string
+	defaultExplorerModel string // model used for the explore phase of two-phase Consult
+	sessions             *Sessions
+	tracer               trace.Tracer
+	version              string
+	explorer             *explorer.Explorer
+	maxToolIterations    int
+	systemPrompt         string // composed at startup; per-call SystemPrompt overrides
+	explorerSystemPrompt string // system prompt used during the explore phase
 
 	retryMax      int
 	retryBaseWait time.Duration

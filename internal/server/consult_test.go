@@ -12,10 +12,10 @@ import (
 // of responses so tests can assert on the history sent across multiple
 // turns of the same session.
 type recordingClient struct {
-	requests []*deepseek.ChatCompletionRequest
+	requests  []*deepseek.ChatCompletionRequest
 	responses []*deepseek.ChatCompletionResponse
-	err      error
-	idx      int
+	err       error
+	idx       int
 }
 
 func (r *recordingClient) CreateChatCompletion(ctx context.Context, req *deepseek.ChatCompletionRequest) (*deepseek.ChatCompletionResponse, error) {
