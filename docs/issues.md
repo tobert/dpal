@@ -72,9 +72,11 @@ concrete. When an item ships, delete the entry.
   thinking-on so file selection is reasoned rather than swept. read_file
   on the same broad review fell 29 -> 25 (nudge) -> 19 (thinking), and
   the 19 are now the genuinely relevant files (it skips ~14 unrelated
-  ones). Still open: (b) code-side repeat-detection (skip duplicate tool
-  calls), and a focused-prompt measurement to confirm thinking makes
-  narrow scopes surgical (~3 reads), which the broad prompt can't show.
+  ones). The explorer is now scope-sensitive: a focused prompt ("review
+  just the tool_choice change") read 6 files (project_tree -> 4 targeted
+  search_project -> 6 reads) vs 19 for the broad one — thinking lets it
+  scale effort to scope, which the non-thinking explorer couldn't.
+  Still open: (b) code-side repeat-detection (skip duplicate tool calls).
 
 - **OTel not on by default for the install command.** README's
   `claude mcp add` example doesn't pass `--otel-endpoint`. When the
