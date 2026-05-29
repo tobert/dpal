@@ -21,6 +21,20 @@ concrete. When an item ships, delete the entry.
 
 ## Reliability
 
+- **Verify `tool_choice:"none"` actually suppresses the synth tool-call
+  leak (live).** Symptom: the synthesizer, fed the explorer's tool-call
+  transcript with no `tools` declared, continued the tool loop — emitting
+  raw tool-call markup into `content` while the real answer landed in
+  `reasoning_content`. Root: an inconsistent request (tool-call history,
+  no `tools`, no `tool_choice`). Shipped: the synth call now sends
+  `tool_choice:"none"` (`server.go`); offline tests confirm dpal sends it.
+  NOT yet confirmed against the live API that DeepSeek (a) accepts
+  `tool_choice` with no `tools` declared and (b) actually stops the leak.
+  Re-run a broad review through the new binary to confirm. If it recurs:
+  declare the explorer tool defs on the synth call too (full request
+  consistency), or flatten the tool transcript into plain content before
+  synthesis.
+
 - **`--otel-insecure` defaults to true.** Sane for local collectors;
   foot-gun for accidental remote OTLP. DeepSeek's self-review
   suggested flipping the default to false. Defer until we see a real
@@ -64,14 +78,15 @@ concrete. When an item ships, delete the entry.
   reconstruct the reasoning view by walking `sess.messages` and drop
   the parallel array.
 
-- **Investigate explorer-loop behavior on broad-scope prompts.** Even
-  with the V4-aware explorer prompt, an open-ended "review everything"
-  scope could push past the 10-iteration cap. We confirmed the new
-  prompt holds for focused tasks (14 tool calls inside the cap on a
-  5-file scope). If broad scopes become a real workflow, options:
-  (a) raise the cap, (b) add code-side repeat-detection (skip
-  duplicate tool calls), (c) further tighten the prompt with a hard
-  numeric file budget.
+- **Explorer-loop behavior on broad-scope prompts.** Open-ended scopes
+  push tool-call counts up; a broad commit review blew the old
+  10-iteration cap. Shipped: cap raised to 25 (`server.go`), and a
+  `project_tree` tool so the explorer orients in one call instead of
+  walking dirs — the observed waste was ~25 of ~50 calls in
+  list_directory/search_project (median ~150-byte navigation results),
+  while the reads themselves were already whole-file. Still open:
+  (b) code-side repeat-detection (skip duplicate tool calls), and
+  confirming on a re-run that project_tree actually drops the count.
 
 - **OTel not on by default for the install command.** README's
   `claude mcp add` example doesn't pass `--otel-endpoint`. When the

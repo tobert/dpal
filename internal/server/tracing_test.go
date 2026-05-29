@@ -30,6 +30,27 @@ func attrIndex(span tracetest.SpanStub) map[string]any {
 	return out
 }
 
+// spansNamed returns the exported spans whose name matches.
+func spansNamed(spans tracetest.SpanStubs, name string) []tracetest.SpanStub {
+	var out []tracetest.SpanStub
+	for _, s := range spans {
+		if s.Name == name {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// mustOne fetches the single span with the given name, failing otherwise.
+func mustOne(t *testing.T, spans tracetest.SpanStubs, name string) tracetest.SpanStub {
+	t.Helper()
+	got := spansNamed(spans, name)
+	if len(got) != 1 {
+		t.Fatalf("got %d %q spans, want 1", len(got), name)
+	}
+	return got[0]
+}
+
 func makeRespWithUsage(model, content, reasoning string, in, out, hit, miss int) *deepseek.ChatCompletionResponse {
 	return &deepseek.ChatCompletionResponse{
 		Model: model,
@@ -57,13 +78,12 @@ func TestOneshot_EmitsSpanWithGenAIAttributes(t *testing.T) {
 	}
 
 	spans := exporter.GetSpans()
-	if len(spans) != 1 {
-		t.Fatalf("got %d spans, want 1", len(spans))
+	// The oneshot wraps its single upstream call in a consult_deepseek_oneshot
+	// operation span; the gen_ai attributes live on the inner deepseek.chat.
+	if len(spansNamed(spans, "consult_deepseek_oneshot")) != 1 {
+		t.Errorf("want one consult_deepseek_oneshot operation span; spans=%v", spans)
 	}
-	span := spans[0]
-	if span.Name != "deepseek.chat" {
-		t.Errorf("span name = %q, want %q", span.Name, "deepseek.chat")
-	}
+	span := mustOne(t, spans, "deepseek.chat")
 
 	attrs := attrIndex(span)
 	want := map[string]any{
@@ -95,15 +115,18 @@ func TestChat_RecordsErrorOnFailedCall(t *testing.T) {
 	}
 
 	spans := exporter.GetSpans()
-	if len(spans) != 1 {
-		t.Fatalf("got %d spans, want 1", len(spans))
-	}
-	span := spans[0]
+	span := mustOne(t, spans, "deepseek.chat")
 	if span.Status.Code.String() != "Error" {
 		t.Errorf("span status = %s, want Error", span.Status.Code)
 	}
 	if len(span.Events) == 0 {
 		t.Error("expected error event recorded on span, got none")
+	}
+	// The failure must propagate to the operation span so a trace search by
+	// error surfaces the whole consult, not just the inner HTTP attempt.
+	root := mustOne(t, spans, "consult_deepseek_oneshot")
+	if root.Status.Code.String() != "Error" {
+		t.Errorf("operation span status = %s, want Error", root.Status.Code)
 	}
 }
 
@@ -124,15 +147,18 @@ func TestConsult_EmitsOneSpanPerTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	spans := exporter.GetSpans()
-	if len(spans) != 2 {
-		t.Fatalf("got %d spans, want 2", len(spans))
+	// Each turn now nests deepseek.chat under a dpal.synthesize phase under a
+	// consult_deepseek operation span; assert on the chat spans themselves.
+	// SimpleSpanProcessor exports in End order, so chat[0] is the first turn.
+	chat := spansNamed(exporter.GetSpans(), "deepseek.chat")
+	if len(chat) != 2 {
+		t.Fatalf("got %d deepseek.chat spans, want 2", len(chat))
 	}
-	if got := attrIndex(spans[0])["gen_ai.request.message_count"]; got != int64(1) {
-		t.Errorf("first span message_count = %v, want 1", got)
+	if got := attrIndex(chat[0])["gen_ai.request.message_count"]; got != int64(1) {
+		t.Errorf("first turn message_count = %v, want 1", got)
 	}
-	if got := attrIndex(spans[1])["gen_ai.request.message_count"]; got != int64(3) {
-		t.Errorf("second span message_count = %v, want 3 (user/assistant/user)", got)
+	if got := attrIndex(chat[1])["gen_ai.request.message_count"]; got != int64(3) {
+		t.Errorf("second turn message_count = %v, want 3 (user/assistant/user)", got)
 	}
 }
 
@@ -148,13 +174,57 @@ func TestChat_NestsUnderParentContext(t *testing.T) {
 	parent.End()
 
 	spans := exporter.GetSpans()
-	if len(spans) != 2 {
-		t.Fatalf("got %d spans, want 2", len(spans))
+	incoming := mustOne(t, spans, "incoming.tool_call")
+	oneshot := mustOne(t, spans, "consult_deepseek_oneshot")
+	chat := mustOne(t, spans, "deepseek.chat")
+
+	// The operation span hangs off the caller's span, and the upstream call
+	// hangs off the operation span — a single connected trace.
+	if oneshot.Parent.SpanID() != incoming.SpanContext.SpanID() {
+		t.Errorf("oneshot.parent = %s, want incoming.tool_call %s",
+			oneshot.Parent.SpanID(), incoming.SpanContext.SpanID())
 	}
-	// SimpleSpanProcessor exports in End order: child first, then parent.
-	child, parentSpan := spans[0], spans[1]
-	if child.Parent.SpanID() != parentSpan.SpanContext.SpanID() {
-		t.Errorf("child.parent_span_id = %s, want %s (parent span)",
-			child.Parent.SpanID(), parentSpan.SpanContext.SpanID())
+	if chat.Parent.SpanID() != oneshot.SpanContext.SpanID() {
+		t.Errorf("chat.parent = %s, want consult_deepseek_oneshot %s",
+			chat.Parent.SpanID(), oneshot.SpanContext.SpanID())
+	}
+}
+
+// TestConsult_SpanTreeIsParented is the regression guard for the orphan-span
+// bug: explore/synth phases and every tool call must hang off one consult
+// operation span, not scatter as independent root traces.
+func TestConsult_SpanTreeIsParented(t *testing.T) {
+	tracer, exporter := newTestTracer()
+	rec := &recordingClient{responses: []*deepseek.ChatCompletionResponse{
+		toolCallResp("list_directory", `{"path":"."}`, "call_1"), // explore iter 0: call a tool
+		makeResp("explorer draft", ""),                           // explore iter 1: finalize
+		makeResp("synth answer", ""),                             // synth
+	}}
+	s := New(rec).WithTracer(tracer).WithExplorer(newSandboxExplorer(t))
+
+	if _, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+
+	spans := exporter.GetSpans()
+	root := mustOne(t, spans, "consult_deepseek")
+	explore := mustOne(t, spans, "dpal.explore")
+	synth := mustOne(t, spans, "dpal.synthesize")
+	toolCall := mustOne(t, spans, "explorer.tool_call")
+
+	if explore.Parent.SpanID() != root.SpanContext.SpanID() {
+		t.Errorf("dpal.explore parent = %s, want consult_deepseek root", explore.Parent.SpanID())
+	}
+	if synth.Parent.SpanID() != root.SpanContext.SpanID() {
+		t.Errorf("dpal.synthesize parent = %s, want consult_deepseek root", synth.Parent.SpanID())
+	}
+	if toolCall.Parent.SpanID() != explore.SpanContext.SpanID() {
+		t.Errorf("explorer.tool_call parent = %s, want dpal.explore (was an orphan root)", toolCall.Parent.SpanID())
+	}
+	if got := len(spansNamed(spans, "deepseek.chat")); got != 3 {
+		t.Errorf("got %d deepseek.chat spans, want 3 (2 explore iters + 1 synth)", got)
+	}
+	if got := attrIndex(explore)["dpal.explorer_tool_calls"]; got != int64(1) {
+		t.Errorf("dpal.explore explorer_tool_calls = %v, want 1", got)
 	}
 }

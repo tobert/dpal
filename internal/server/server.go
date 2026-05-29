@@ -23,7 +23,14 @@ import (
 	"github.com/tobert/dpal/internal/explorer"
 )
 
-const defaultMaxToolIterations = 10
+const defaultMaxToolIterations = 25
+
+// toolChoiceNone is the OpenAI-compatible tool_choice value that forbids
+// the model from calling any tool. dpal sets it on the synthesizer call so
+// the synth answers from the explorer's loaded context instead of trying to
+// continue the tool loop (which, with no tools advertised, would leak raw
+// tool-call markup into the response content).
+const toolChoiceNone = "none"
 
 // V4 model IDs. deepseek-go v1.3.4 only exposes the legacy DeepSeekChat
 // ("deepseek-chat") and DeepSeekReasoner ("deepseek-reasoner") aliases.
@@ -164,6 +171,7 @@ func (s *Server) chat(
 	messages []deepseek.ChatCompletionMessage,
 	enableThinking bool,
 	reasoningEffort string,
+	toolChoice string,
 ) (*deepseek.ChatCompletionResponse, []deepseek.ChatCompletionMessage, error) {
 	msgs := make([]deepseek.ChatCompletionMessage, len(messages))
 	copy(msgs, messages)
@@ -179,7 +187,7 @@ func (s *Server) chat(
 	}
 
 	for iter := 0; iter < maxIter; iter++ {
-		resp, err := s.callOnce(ctx, model, systemPrompt, msgs, tools, iter, enableThinking, reasoningEffort)
+		resp, err := s.callOnce(ctx, model, systemPrompt, msgs, tools, iter, enableThinking, reasoningEffort, toolChoice)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -243,6 +251,7 @@ func (s *Server) callOnce(
 	iter int,
 	enableThinking bool,
 	reasoningEffort string,
+	toolChoice string,
 ) (*deepseek.ChatCompletionResponse, error) {
 	var lastErr error
 	for attempt := 0; attempt <= s.retryMax; attempt++ {
@@ -254,7 +263,7 @@ func (s *Server) callOnce(
 				return nil, ctx.Err()
 			}
 		}
-		resp, err := s.callAttempt(ctx, model, systemPrompt, messages, tools, iter, attempt, enableThinking, reasoningEffort)
+		resp, err := s.callAttempt(ctx, model, systemPrompt, messages, tools, iter, attempt, enableThinking, reasoningEffort, toolChoice)
 		if err == nil {
 			return resp, nil
 		}
@@ -303,6 +312,7 @@ func (s *Server) callAttempt(
 	attempt int,
 	enableThinking bool,
 	reasoningEffort string,
+	toolChoice string,
 ) (*deepseek.ChatCompletionResponse, error) {
 	outbound := messages
 	if systemPrompt != "" {
@@ -331,6 +341,9 @@ func (s *Server) callAttempt(
 	if reasoningEffort != "" {
 		span.SetAttributes(attribute.String("dpal.reasoning_effort", reasoningEffort))
 	}
+	if toolChoice != "" {
+		span.SetAttributes(attribute.String("dpal.tool_choice", toolChoice))
+	}
 
 	req := &deepseek.ChatCompletionRequest{
 		Model:          model,
@@ -339,6 +352,13 @@ func (s *Server) callAttempt(
 	}
 	if len(tools) > 0 {
 		req.Tools = tools
+	}
+	// tool_choice lets the caller forbid tool use ("none") even when the
+	// message history references prior tool calls. The synth phase uses
+	// this: it is fed the explorer's tool-call transcript but must answer,
+	// not call tools. Omitting it (empty) leaves the model's default.
+	if toolChoice != "" {
+		req.ToolChoice = toolChoice
 	}
 	// reasoning_effort isn't a first-class field in deepseek-go; pass it
 	// through ExtraFields, which the SDK merges into the top-level request
@@ -515,7 +535,7 @@ func (s *Server) ConsultOneshot(
 	ctx context.Context,
 	req *mcp.CallToolRequest,
 	in OneshotInput,
-) (*mcp.CallToolResult, OneshotOutput, error) {
+) (_ *mcp.CallToolResult, _ OneshotOutput, retErr error) {
 	if strings.TrimSpace(in.Prompt) == "" {
 		return nil, OneshotOutput{}, fmt.Errorf("prompt is required")
 	}
@@ -538,9 +558,24 @@ func (s *Server) ConsultOneshot(
 		enableThinking = *in.Thinking
 	}
 
+	// Operation span: parents the single upstream deepseek.chat so a oneshot
+	// is one connected trace, and surfaces failures at the operation level.
+	ctx, span := s.tracer.Start(ctx, "consult_deepseek_oneshot",
+		trace.WithAttributes(
+			attribute.String("gen_ai.operation.name", "consult_oneshot"),
+			attribute.String("gen_ai.request.model", model),
+		),
+	)
+	defer func() {
+		if retErr != nil {
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.End()
+	}()
+
 	resp, _, err := s.chat(ctx, model, sysPrompt, nil, []deepseek.ChatCompletionMessage{
 		{Role: deepseek.ChatMessageRoleUser, Content: in.Prompt},
-	}, enableThinking, in.ReasoningEffort)
+	}, enableThinking, in.ReasoningEffort, "")
 	if err != nil {
 		return nil, OneshotOutput{}, fmt.Errorf("deepseek call failed: %w", err)
 	}
@@ -602,7 +637,7 @@ func (s *Server) Consult(
 	ctx context.Context,
 	req *mcp.CallToolRequest,
 	in ConsultInput,
-) (*mcp.CallToolResult, ConsultOutput, error) {
+) (_ *mcp.CallToolResult, _ ConsultOutput, retErr error) {
 	if strings.TrimSpace(in.SessionID) == "" {
 		return nil, ConsultOutput{}, fmt.Errorf("session_id is required")
 	}
@@ -619,6 +654,24 @@ func (s *Server) Consult(
 	if explorerModel == "" {
 		explorerModel = s.defaultExplorerModel
 	}
+
+	// Operation span: the root that the explore/synth phase spans (and every
+	// upstream call and tool call beneath them) hang off, so one consult is
+	// one connected trace rather than scattered orphan spans.
+	ctx, opSpan := s.tracer.Start(ctx, "consult_deepseek",
+		trace.WithAttributes(
+			attribute.String("gen_ai.operation.name", "consult"),
+			attribute.String("gen_ai.request.model", synthModel),
+			attribute.String("dpal.session_id", in.SessionID),
+			attribute.Bool("dpal.explore_disabled", in.DisableExplore),
+		),
+	)
+	defer func() {
+		if retErr != nil {
+			opSpan.SetStatus(codes.Error, retErr.Error())
+		}
+		opSpan.End()
+	}()
 
 	sess := s.sessions.Acquire(in.SessionID)
 	sess.mu.Lock()
@@ -663,12 +716,18 @@ func (s *Server) Consult(
 			explorerSys = synthSysPrompt
 		}
 
-		_, withExploration, err := s.chat(ctx, explorerModel, explorerSys, exp, candidate, false, "")
+		exploreCtx, exploreSpan := s.tracer.Start(ctx, "dpal.explore",
+			trace.WithAttributes(attribute.String("gen_ai.request.model", explorerModel)))
+		_, withExploration, err := s.chat(exploreCtx, explorerModel, explorerSys, exp, candidate, false, "", "")
 		if err != nil {
+			exploreSpan.SetStatus(codes.Error, err.Error())
+			exploreSpan.End()
 			return nil, ConsultOutput{}, fmt.Errorf("deepseek explore phase failed: %w", err)
 		}
 
 		candidate, explorerToolCalls = stripExplorerSynthesis(withExploration, len(candidate))
+		exploreSpan.SetAttributes(attribute.Int("dpal.explorer_tool_calls", explorerToolCalls))
+		exploreSpan.End()
 		usedExplorer = explorerModel
 	}
 
@@ -683,14 +742,24 @@ func (s *Server) Consult(
 
 	// Phase 2: synthesize. No tools advertised — the synthesizer reads
 	// whatever the explorer loaded into the candidate transcript and
-	// writes a final answer.
-	resp, updated, err := s.chat(ctx, synthModel, synthSysPrompt, nil, candidate, enableThinking, in.ReasoningEffort)
+	// writes a final answer. tool_choice="none" forbids it from trying to
+	// continue the tool loop: the candidate carries the explorer's
+	// tool-call transcript, which otherwise primes the model to emit a
+	// tool call that (with no tools advertised) leaks as raw markup into
+	// the answer content.
+	synthCtx, synthSpan := s.tracer.Start(ctx, "dpal.synthesize",
+		trace.WithAttributes(attribute.String("gen_ai.request.model", synthModel)))
+	resp, updated, err := s.chat(synthCtx, synthModel, synthSysPrompt, nil, candidate, enableThinking, in.ReasoningEffort, toolChoiceNone)
 	if err != nil {
+		synthSpan.SetStatus(codes.Error, err.Error())
+		synthSpan.End()
 		return nil, ConsultOutput{}, fmt.Errorf("deepseek synthesize phase failed: %w", err)
 	}
 	if len(resp.Choices) == 0 {
+		synthSpan.End()
 		return nil, ConsultOutput{}, fmt.Errorf("deepseek returned no choices")
 	}
+	synthSpan.End()
 
 	sess.messages = updated
 	msg := resp.Choices[0].Message
@@ -701,6 +770,12 @@ func (s *Server) Consult(
 			turnCount++
 		}
 	}
+
+	opSpan.SetAttributes(
+		attribute.Int("dpal.explorer_tool_calls", explorerToolCalls),
+		attribute.Int("dpal.turn_count", turnCount),
+		attribute.String("dpal.explorer_model", usedExplorer),
+	)
 
 	if msg.ReasoningContent != "" {
 		sess.reasoning = append(sess.reasoning, ReasoningEntry{
