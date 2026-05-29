@@ -141,8 +141,8 @@ func TestExplorePhase_NoToolsAdvertisedDuringSynth(t *testing.T) {
 	if len(rec.requests) != 2 {
 		t.Fatalf("expected 2 upstream calls, got %d", len(rec.requests))
 	}
-	if len(rec.requests[0].Tools) != 3 {
-		t.Errorf("explore phase Tools = %d, want 3", len(rec.requests[0].Tools))
+	if len(rec.requests[0].Tools) != 4 {
+		t.Errorf("explore phase Tools = %d, want 4", len(rec.requests[0].Tools))
 	}
 	if len(rec.requests[1].Tools) != 0 {
 		t.Errorf("synth phase Tools = %d, want 0 (no tools in synth)", len(rec.requests[1].Tools))

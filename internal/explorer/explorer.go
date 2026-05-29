@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	deepseek "github.com/cohesion-org/deepseek-go"
+	gitignore "github.com/denormal/go-gitignore"
 )
 
 const (
@@ -24,7 +25,26 @@ const (
 	defaultMaxSearchHits        = 200
 	defaultMaxListEntries       = 1000
 	defaultMaxSearchBytes int64 = 512 * 1024 // skip files larger than this in search
+	defaultMaxTreeEntries       = 2000       // cap on project_tree lines
+	defaultMaxTreeBytes   int64 = 64 * 1024  // cap on project_tree output size
 )
+
+// defaultTreeSkipDirs are directory names project_tree always prunes,
+// independent of .gitignore — near-universal VCS/dependency/build/cache dirs
+// whose contents would bloat the listing (and can break a session) without
+// informing a review. Project-specific ignores layer on top via .gitignore.
+var defaultTreeSkipDirs = map[string]bool{
+	".git":          true,
+	"node_modules":  true,
+	"vendor":        true,
+	"target":        true,
+	"__pycache__":   true,
+	".venv":         true,
+	".tox":          true,
+	".mypy_cache":   true,
+	".pytest_cache": true,
+	".idea":         true,
+}
 
 // Explorer is the sandbox + dispatcher for the project-inspection tools.
 type Explorer struct {
@@ -33,6 +53,8 @@ type Explorer struct {
 	maxSearchHits  int
 	maxListEntries int
 	maxSearchBytes int64
+	maxTreeEntries int
+	maxTreeBytes   int64
 }
 
 // New constructs an Explorer rooted at root. The path is made absolute
@@ -62,6 +84,8 @@ func New(root string) (*Explorer, error) {
 		maxSearchHits:  defaultMaxSearchHits,
 		maxListEntries: defaultMaxListEntries,
 		maxSearchBytes: defaultMaxSearchBytes,
+		maxTreeEntries: defaultMaxTreeEntries,
+		maxTreeBytes:   defaultMaxTreeBytes,
 	}, nil
 }
 
@@ -280,8 +304,105 @@ func ternary(cond bool, a, b string) string {
 	return b
 }
 
-// ToolDefinitions returns the DeepSeek tool schemas for the three
-// exploration tools, suitable for inclusion in a ChatCompletionRequest.
+// ProjectTree returns a compact, flat listing of the files and directories
+// under path (relative to the sandbox root; "." for the root itself) so the
+// model can orient itself in one call instead of walking the tree directory
+// by directory. The output is bounded: directories in defaultTreeSkipDirs
+// and paths matched by the project's .gitignore are pruned, and the listing
+// is capped by entry count and total bytes with a trailing truncation
+// marker. Directories carry a trailing slash; files carry their size.
+func (e *Explorer) ProjectTree(path string) (string, error) {
+	root, err := e.resolve(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return "", fmt.Errorf("project_tree %q: %w", path, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("project_tree %q: is not a directory", path)
+	}
+
+	// .gitignore matcher rooted at the sandbox root; honors nested
+	// .gitignore files. A missing/unreadable ignore set is surfaced in the
+	// output (not silently swallowed) but does not fail the walk — the
+	// built-in skip-set still applies.
+	var ignore gitignore.GitIgnore
+	var ignoreNote string
+	if gi, gerr := gitignore.NewRepository(e.root); gerr != nil {
+		ignoreNote = fmt.Sprintf("(note: .gitignore not applied: %v)\n", gerr)
+	} else {
+		ignore = gi
+	}
+
+	rel, _ := filepath.Rel(e.root, root)
+	if rel == "" {
+		rel = "."
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "project tree %s\n", rel)
+	b.WriteString(ignoreNote)
+
+	entries := 0
+	skipped := 0
+	truncated := false
+
+	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			skipped++
+			return nil
+		}
+		if p == root {
+			return nil // the tree root itself is the header, not an entry
+		}
+		isDir := d.IsDir()
+		if isDir && defaultTreeSkipDirs[d.Name()] {
+			return filepath.SkipDir
+		}
+		if ignore != nil {
+			if m := ignore.Absolute(p, isDir); m != nil && m.Ignore() {
+				if isDir {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+		}
+
+		if entries >= e.maxTreeEntries || int64(b.Len()) >= e.maxTreeBytes {
+			truncated = true
+			return filepath.SkipAll
+		}
+
+		rp, _ := filepath.Rel(e.root, p)
+		if isDir {
+			fmt.Fprintf(&b, "%s/\n", rp)
+		} else if fi, ierr := d.Info(); ierr == nil {
+			fmt.Fprintf(&b, "%s  %d\n", rp, fi.Size())
+		} else {
+			fmt.Fprintf(&b, "%s\n", rp)
+		}
+		entries++
+		return nil
+	})
+	if walkErr != nil {
+		return "", fmt.Errorf("project_tree: walk: %w", walkErr)
+	}
+
+	fmt.Fprintf(&b, "(%d entries", entries)
+	if truncated {
+		fmt.Fprintf(&b, "; truncated at cap (max %d entries / %d bytes)", e.maxTreeEntries, e.maxTreeBytes)
+	}
+	if skipped > 0 {
+		fmt.Fprintf(&b, "; %d unreadable", skipped)
+	}
+	b.WriteString(")\n")
+	return b.String(), nil
+}
+
+// ToolDefinitions returns the DeepSeek tool schemas for the exploration
+// tools, suitable for inclusion in a ChatCompletionRequest.
 func (e *Explorer) ToolDefinitions() []deepseek.Tool {
 	stringProp := func(desc string) map[string]any {
 		return map[string]any{"type": "string", "description": desc}
@@ -330,6 +451,20 @@ func (e *Explorer) ToolDefinitions() []deepseek.Tool {
 				},
 			},
 		},
+		{
+			Type: "function",
+			Function: deepseek.Function{
+				Name:        "project_tree",
+				Description: "List the project's file layout in one call to orient yourself before reading files. Returns relative paths (directories end in '/', files show their byte size). Honors .gitignore and skips dependency/build dirs (.git, node_modules, vendor, target, __pycache__, etc.). Output is capped, so very large trees are truncated with a marker.",
+				Parameters: &deepseek.FunctionParameters{
+					Type: "object",
+					Properties: map[string]any{
+						"path": stringProp("Directory to list, relative to the project root. Use '.' for the whole project."),
+					},
+					Required: []string{"path"},
+				},
+			},
+		},
 	}
 }
 
@@ -373,6 +508,21 @@ func (e *Explorer) Dispatch(name string, argsJSON string) string {
 			return fmt.Sprintf("error: invalid arguments for search_project: %v", err)
 		}
 		out, err := e.SearchProject(args.Pattern, args.Glob)
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		return out
+	case "project_tree":
+		var args struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return fmt.Sprintf("error: invalid arguments for project_tree: %v", err)
+		}
+		if args.Path == "" {
+			args.Path = "."
+		}
+		out, err := e.ProjectTree(args.Path)
 		if err != nil {
 			return "error: " + err.Error()
 		}

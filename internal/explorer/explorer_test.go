@@ -1,6 +1,7 @@
 package explorer
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,6 +22,13 @@ func newTestExplorer(t *testing.T) (*Explorer, string) {
 func writeFile(t *testing.T, dir, name, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mkdir(t *testing.T, dir, name string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -285,10 +293,10 @@ func TestDispatch_UnknownToolErrors(t *testing.T) {
 	}
 }
 
-func TestToolDefinitions_CoversAllThreeTools(t *testing.T) {
+func TestToolDefinitions_CoversAllTools(t *testing.T) {
 	exp, _ := newTestExplorer(t)
 	defs := exp.ToolDefinitions()
-	want := map[string]bool{"list_directory": false, "read_file": false, "search_project": false}
+	want := map[string]bool{"list_directory": false, "read_file": false, "search_project": false, "project_tree": false}
 	for _, d := range defs {
 		if d.Type != "function" {
 			t.Errorf("tool type = %q, want %q", d.Type, "function")
@@ -299,5 +307,73 @@ func TestToolDefinitions_CoversAllThreeTools(t *testing.T) {
 		if !found {
 			t.Errorf("missing tool definition for %q", name)
 		}
+	}
+}
+
+func TestProjectTree_HonorsGitignore(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, ".gitignore", "ignored/\n*.log\n")
+	writeFile(t, dir, "keep.go", "package x")
+	writeFile(t, dir, "app.log", "noise")
+	mkdir(t, dir, "ignored")
+	writeFile(t, dir, "ignored/secret.go", "shh")
+	mkdir(t, dir, "sub")
+	writeFile(t, dir, "sub/keep.txt", "ok")
+
+	out, err := exp.ProjectTree(".")
+	if err != nil {
+		t.Fatalf("ProjectTree: %v", err)
+	}
+	if !strings.Contains(out, "keep.go") || !strings.Contains(out, "sub/keep.txt") {
+		t.Errorf("expected tracked files in tree, got:\n%s", out)
+	}
+	for _, gone := range []string{"secret.go", "app.log", "ignored/"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("gitignored path %q leaked into tree:\n%s", gone, out)
+		}
+	}
+}
+
+func TestProjectTree_SkipsDefaultDirs(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	// No .gitignore: the built-in skip-set must still prune dependency/build
+	// dirs so a Rust target/ or node_modules can't blow up the output.
+	mkdir(t, dir, "node_modules")
+	writeFile(t, dir, "node_modules/dep.js", "x")
+	mkdir(t, dir, "target")
+	writeFile(t, dir, "target/huge.bin", "x")
+	writeFile(t, dir, "main.rs", "fn main(){}")
+
+	out, err := exp.ProjectTree(".")
+	if err != nil {
+		t.Fatalf("ProjectTree: %v", err)
+	}
+	if !strings.Contains(out, "main.rs") {
+		t.Errorf("expected source file in tree, got:\n%s", out)
+	}
+	for _, gone := range []string{"node_modules", "target", "dep.js", "huge.bin"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("skip-set dir %q leaked into tree:\n%s", gone, out)
+		}
+	}
+}
+
+func TestProjectTree_CapsEntriesAndMarksTruncation(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	exp.maxTreeEntries = 3
+	for i := range 50 {
+		writeFile(t, dir, fmt.Sprintf("f%02d.txt", i), "x")
+	}
+	out, err := exp.ProjectTree(".")
+	if err != nil {
+		t.Fatalf("ProjectTree: %v", err)
+	}
+	if !strings.Contains(out, "truncat") {
+		t.Errorf("expected a truncation marker when the entry cap is hit, got:\n%s", out)
+	}
+	// Count emitted file lines (those carrying a byte size); must not exceed cap.
+	got := strings.Count(out, ".txt")
+	if got > exp.maxTreeEntries {
+		t.Errorf("emitted %d entries, want <= cap %d", got, exp.maxTreeEntries)
 	}
 }
