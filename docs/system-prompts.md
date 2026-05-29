@@ -29,6 +29,19 @@ prompt had told it to use exploration tools that the synthesizer phase
 can't reach, and the model dutifully tried. That live failure drove the
 biggest single change — dropping the tool block from the shared prompt.
 
+**Correction (later, from a live eval):** dropping the prompt's tool
+block was necessary but not sufficient. The same leak recurs even with
+the cleaned-up prompt, because the *message history* — not the prompt —
+is what primes it: the synthesizer is fed the explorer's tool-call
+transcript, sees a conversation mid-tool-loop, and continues it. With
+`tools=nil` the API can't structure that attempt, so raw tool-call
+markup lands in `content` while the real answer sits in
+`reasoning_content`. The code-side fix is `tool_choice:"none"` on the
+synth call (see `server.go` and `docs/issues.md`): the protocol's
+explicit "don't call tools" knob, which holds regardless of what the
+history or prompt suggest. The prose principle below still stands; it
+just isn't the whole story.
+
 ## Principles that emerged
 
 Preserve these unless a future round of testing falsifies them:
