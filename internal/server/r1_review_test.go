@@ -124,10 +124,11 @@ func TestConsult_ConcurrentSameSessionSerializesViaMutex(t *testing.T) {
 	}
 }
 
-// TestConsult_ThinkingModeOnByDefaultForSynth — V4 behavior: the synth
-// call uses thinking mode (EnableThinking: true) unless explicitly
-// overridden. The explore phase always runs without thinking regardless.
-func TestConsult_ThinkingModeOnByDefaultForSynth(t *testing.T) {
+// TestConsult_ThinkingModeOnForBothPhases — both phases run with thinking.
+// The synth has always used it (V4-Pro default); the explore phase now does
+// too, because since project_tree the explorer must reason about which files
+// the answer depends on rather than just pattern-match-and-load.
+func TestConsult_ThinkingModeOnForBothPhases(t *testing.T) {
 	exp := newSandboxExplorer(t)
 	rec := &recordingClient{
 		responses: []*deepseek.ChatCompletionResponse{
@@ -143,11 +144,44 @@ func TestConsult_ThinkingModeOnByDefaultForSynth(t *testing.T) {
 	if len(rec.requests) != 2 {
 		t.Fatalf("expected 2 upstream calls, got %d", len(rec.requests))
 	}
-	if rec.requests[0].EnableThinking {
-		t.Errorf("explore phase EnableThinking = true, want false (exploration is not a thinking-mode workload)")
+	if !rec.requests[0].EnableThinking {
+		t.Errorf("explore phase EnableThinking = false, want true (file selection is a reasoning task)")
 	}
 	if !rec.requests[1].EnableThinking {
 		t.Errorf("synth phase EnableThinking = false, want true (V4-Pro default)")
+	}
+}
+
+// TestConsult_ExplorerReasoningStrippedBeforeSynth — the explorer thinks, but
+// its reasoning_content must not reach the synthesizer: it's flash's private
+// deliberation about what to load, noise for the pro model, and a context
+// bloat. The synth must see the explorer's tool turns with empty reasoning.
+func TestConsult_ExplorerReasoningStrippedBeforeSynth(t *testing.T) {
+	exp := newSandboxExplorer(t)
+	rec := &recordingClient{
+		responses: []*deepseek.ChatCompletionResponse{
+			// explore iter 0: a tool call carrying reasoning_content
+			func() *deepseek.ChatCompletionResponse {
+				r := toolCallResp("read_file", `{"path":"note.txt"}`, "call_1")
+				r.Choices[0].Message.ReasoningContent = "I should open note.txt to answer this."
+				return r
+			}(),
+			finalResp("Loaded note.txt."), // explore iter 1: finalize (stripped)
+			makeResp("synth answer", "synth reasoning"),
+		},
+	}
+	s := New(rec).WithExplorer(exp)
+
+	if _, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "what's in the note?"}); err != nil {
+		t.Fatal(err)
+	}
+	// rec.requests[2] is the synth call; the explorer's tool-call turn must
+	// be present (history) but carry no reasoning_content.
+	synthMsgs := rec.requests[2].Messages
+	for _, m := range synthMsgs {
+		if m.Role == deepseek.ChatMessageRoleAssistant && m.ReasoningContent != "" {
+			t.Errorf("explorer reasoning leaked into synth context: %q", m.ReasoningContent)
+		}
 	}
 }
 

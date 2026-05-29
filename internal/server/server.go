@@ -603,7 +603,7 @@ type ConsultInput struct {
 	ExplorerModel        string `json:"explorer_model,omitempty" jsonschema:"optional explore-phase model override; defaults to deepseek-v4-flash. Used only when an explorer is configured (i.e. not --no-explore)."`
 	ExplorerSystemPrompt string `json:"explorer_system_prompt,omitempty" jsonschema:"optional system prompt override for the explore phase; takes precedence over the dpal-configured explorer default."`
 	DisableExplore       bool   `json:"disable_explore,omitempty" jsonschema:"set true to skip the explore phase for this call and send the prompt directly to the synthesizer model. Useful when the caller has already curated context."`
-	Thinking             *bool  `json:"thinking,omitempty" jsonschema:"optional override for V4 thinking mode on the synthesizer call; defaults to true. Set false for fast non-thinking synthesis. The explorer phase never uses thinking mode regardless of this setting."`
+	Thinking             *bool  `json:"thinking,omitempty" jsonschema:"optional override for V4 thinking mode on the synthesizer call; defaults to true. Set false for fast non-thinking synthesis. Controls the synthesizer only; the explorer phase always runs with thinking on."`
 	// ReasoningEffort tunes the synthesizer's thinking-mode deliberation.
 	// Applies only to the synth call; the explorer never gets it (explore
 	// is pattern-match-and-load, not deep reasoning). Passed through to
@@ -622,7 +622,7 @@ type ConsultOutput struct {
 }
 
 // Consult is the stateful, agentic chat tool. By default it runs two
-// phases: a cheap explorer model (deepseek-v4-flash, non-thinking)
+// phases: a cheap explorer model (deepseek-v4-flash)
 // drives the tool loop to load relevant code and context, then a
 // stronger synthesizer model (deepseek-v4-pro, thinking) takes the
 // loaded message history and writes the final answer. The explorer's
@@ -699,9 +699,14 @@ func (s *Server) Consult(
 	// `candidate` for the synthesizer to read; the explorer's own final
 	// text answer is dropped so the synthesizer doesn't anchor on it.
 	//
-	// The explorer never uses V4 thinking mode — exploration is
-	// pattern-match-and-load, not deep reasoning, and thinking-mode
-	// tokens on the explorer would be wasted spend.
+	// The explorer runs WITH V4 thinking mode. Since project_tree, the
+	// explorer's job is no longer pattern-match-and-load — it sees the whole
+	// file map and must reason about which handful of files the answer
+	// actually depends on. That selection is a judgment task, and a
+	// non-thinking model defaults to reading everything; a little thinking is
+	// far cheaper than the unnecessary whole-file reads it prevents. The
+	// explorer's reasoning is stripped before the synth call (see
+	// stripExplorerSynthesis) so it never reaches the pro model's context.
 	var explorerToolCalls int
 	usedExplorer := ""
 	if exp != nil && !in.DisableExplore {
@@ -718,7 +723,7 @@ func (s *Server) Consult(
 
 		exploreCtx, exploreSpan := s.tracer.Start(ctx, "dpal.explore",
 			trace.WithAttributes(attribute.String("gen_ai.request.model", explorerModel)))
-		_, withExploration, err := s.chat(exploreCtx, explorerModel, explorerSys, exp, candidate, false, "", "")
+		_, withExploration, err := s.chat(exploreCtx, explorerModel, explorerSys, exp, candidate, true, "", "")
 		if err != nil {
 			exploreSpan.SetStatus(codes.Error, err.Error())
 			exploreSpan.End()
@@ -806,6 +811,16 @@ func (s *Server) Consult(
 // before the explorer ran; messages at that index or later are
 // explorer-produced and subject to stripping.
 //
+// It also omits the explorer's reasoning_content from those turns. The
+// explorer now runs with thinking on, but its deliberation about which
+// files to load is noise for the synthesizer (a different model, no tools)
+// and would bloat the pro model's context. The explore loop already
+// consumed that reasoning internally for its own multi-turn replay; once we
+// hand the transcript to the synth, we drop it — which also matches the
+// pre-thinking behavior, where the explorer produced no reasoning at all.
+// Only explorer-range turns are touched, so prior synth reasoning (which V4
+// requires replayed) is preserved.
+//
 // Also returns the count of tool calls the explorer made, summed across
 // all of its assistant turns.
 func stripExplorerSynthesis(msgs []deepseek.ChatCompletionMessage, originalLen int) ([]deepseek.ChatCompletionMessage, int) {
@@ -814,6 +829,7 @@ func stripExplorerSynthesis(msgs []deepseek.ChatCompletionMessage, originalLen i
 		if msgs[i].Role == deepseek.ChatMessageRoleAssistant {
 			toolCalls += len(msgs[i].ToolCalls)
 		}
+		msgs[i].ReasoningContent = ""
 	}
 	// chat() always appends a final text-only assistant message when
 	// the loop terminates normally (FinishReason != tool_calls). Strip
@@ -838,7 +854,7 @@ func (s *Server) Register(mcpServer *mcp.Server) {
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "consult_deepseek",
 		Description: "Agentic, stateful DeepSeek V4 consultation. Two phases by default: " +
-			"a cheap explorer model (deepseek-v4-flash, non-thinking) reads files via tool calls to load context, " +
+			"a cheap explorer model (deepseek-v4-flash) reads files via tool calls to load context, " +
 			"then a stronger synthesizer model (deepseek-v4-pro with thinking) writes the answer. " +
 			"BOTH MODELS ARE BILLED. Conversation is keyed by session_id; reuse to continue. " +
 			"Set disable_explore=true to skip the explore phase, or use consult_deepseek_oneshot for a single direct call.",

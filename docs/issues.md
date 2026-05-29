@@ -21,20 +21,6 @@ concrete. When an item ships, delete the entry.
 
 ## Reliability
 
-- **Verify `tool_choice:"none"` actually suppresses the synth tool-call
-  leak (live).** Symptom: the synthesizer, fed the explorer's tool-call
-  transcript with no `tools` declared, continued the tool loop — emitting
-  raw tool-call markup into `content` while the real answer landed in
-  `reasoning_content`. Root: an inconsistent request (tool-call history,
-  no `tools`, no `tool_choice`). Shipped: the synth call now sends
-  `tool_choice:"none"` (`server.go`); offline tests confirm dpal sends it.
-  NOT yet confirmed against the live API that DeepSeek (a) accepts
-  `tool_choice` with no `tools` declared and (b) actually stops the leak.
-  Re-run a broad review through the new binary to confirm. If it recurs:
-  declare the explorer tool defs on the synth call too (full request
-  consistency), or flatten the tool transcript into plain content before
-  synthesis.
-
 - **`--otel-insecure` defaults to true.** Sane for local collectors;
   foot-gun for accidental remote OTLP. DeepSeek's self-review
   suggested flipping the default to false. Defer until we see a real
@@ -80,13 +66,15 @@ concrete. When an item ships, delete the entry.
 
 - **Explorer-loop behavior on broad-scope prompts.** Open-ended scopes
   push tool-call counts up; a broad commit review blew the old
-  10-iteration cap. Shipped: cap raised to 25 (`server.go`), and a
-  `project_tree` tool so the explorer orients in one call instead of
-  walking dirs — the observed waste was ~25 of ~50 calls in
-  list_directory/search_project (median ~150-byte navigation results),
-  while the reads themselves were already whole-file. Still open:
-  (b) code-side repeat-detection (skip duplicate tool calls), and
-  confirming on a re-run that project_tree actually drops the count.
+  10-iteration cap. Shipped, in order: cap 10->25; a `project_tree` tool
+  (one-call orientation — killed navigation: search_project 12->~1,
+  list_directory 13->1); a "reading policy" prompt nudge; and explorer
+  thinking-on so file selection is reasoned rather than swept. read_file
+  on the same broad review fell 29 -> 25 (nudge) -> 19 (thinking), and
+  the 19 are now the genuinely relevant files (it skips ~14 unrelated
+  ones). Still open: (b) code-side repeat-detection (skip duplicate tool
+  calls), and a focused-prompt measurement to confirm thinking makes
+  narrow scopes surgical (~3 reads), which the broad prompt can't show.
 
 - **OTel not on by default for the install command.** README's
   `claude mcp add` example doesn't pass `--otel-endpoint`. When the
