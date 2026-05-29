@@ -163,6 +163,7 @@ func (s *Server) chat(
 	exp *explorer.Explorer,
 	messages []deepseek.ChatCompletionMessage,
 	enableThinking bool,
+	reasoningEffort string,
 ) (*deepseek.ChatCompletionResponse, []deepseek.ChatCompletionMessage, error) {
 	msgs := make([]deepseek.ChatCompletionMessage, len(messages))
 	copy(msgs, messages)
@@ -178,7 +179,7 @@ func (s *Server) chat(
 	}
 
 	for iter := 0; iter < maxIter; iter++ {
-		resp, err := s.callOnce(ctx, model, systemPrompt, msgs, tools, iter, enableThinking)
+		resp, err := s.callOnce(ctx, model, systemPrompt, msgs, tools, iter, enableThinking, reasoningEffort)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -241,6 +242,7 @@ func (s *Server) callOnce(
 	tools []deepseek.Tool,
 	iter int,
 	enableThinking bool,
+	reasoningEffort string,
 ) (*deepseek.ChatCompletionResponse, error) {
 	var lastErr error
 	for attempt := 0; attempt <= s.retryMax; attempt++ {
@@ -252,7 +254,7 @@ func (s *Server) callOnce(
 				return nil, ctx.Err()
 			}
 		}
-		resp, err := s.callAttempt(ctx, model, systemPrompt, messages, tools, iter, attempt, enableThinking)
+		resp, err := s.callAttempt(ctx, model, systemPrompt, messages, tools, iter, attempt, enableThinking, reasoningEffort)
 		if err == nil {
 			return resp, nil
 		}
@@ -300,6 +302,7 @@ func (s *Server) callAttempt(
 	iter int,
 	attempt int,
 	enableThinking bool,
+	reasoningEffort string,
 ) (*deepseek.ChatCompletionResponse, error) {
 	outbound := messages
 	if systemPrompt != "" {
@@ -325,6 +328,9 @@ func (s *Server) callAttempt(
 		),
 	)
 	defer span.End()
+	if reasoningEffort != "" {
+		span.SetAttributes(attribute.String("dpal.reasoning_effort", reasoningEffort))
+	}
 
 	req := &deepseek.ChatCompletionRequest{
 		Model:          model,
@@ -333,6 +339,12 @@ func (s *Server) callAttempt(
 	}
 	if len(tools) > 0 {
 		req.Tools = tools
+	}
+	// reasoning_effort isn't a first-class field in deepseek-go; pass it
+	// through ExtraFields, which the SDK merges into the top-level request
+	// payload. Only set it when non-empty so the model default stands.
+	if reasoningEffort != "" {
+		req.ExtraFields = map[string]any{"reasoning_effort": reasoningEffort}
 	}
 
 	resp, err := s.client.CreateChatCompletion(ctx, req)
@@ -480,6 +492,11 @@ type OneshotInput struct {
 	Model        string `json:"model,omitempty" jsonschema:"optional model override; defaults to deepseek-v4-pro"`
 	SystemPrompt string `json:"system_prompt,omitempty" jsonschema:"optional system prompt override for this call; takes precedence over the dpal-configured default"`
 	Thinking     *bool  `json:"thinking,omitempty" jsonschema:"optional override for V4 thinking mode; defaults to true (V4-Pro is a thinking-mode model). Set false to get fast non-thinking responses."`
+	// ReasoningEffort tunes how much the thinking-mode model deliberates.
+	// V4 documents "high" and "max"; the value is passed through to
+	// DeepSeek unmodified, so any value the API accepts works. Empty means
+	// "use the model default" (dpal sends no reasoning_effort field).
+	ReasoningEffort string `json:"reasoning_effort,omitempty" jsonschema:"optional reasoning_effort for thinking mode (e.g. \"high\" or \"max\"); passed through to DeepSeek. Omit to use the model default."`
 }
 
 type OneshotOutput struct {
@@ -523,7 +540,7 @@ func (s *Server) ConsultOneshot(
 
 	resp, _, err := s.chat(ctx, model, sysPrompt, nil, []deepseek.ChatCompletionMessage{
 		{Role: deepseek.ChatMessageRoleUser, Content: in.Prompt},
-	}, enableThinking)
+	}, enableThinking, in.ReasoningEffort)
 	if err != nil {
 		return nil, OneshotOutput{}, fmt.Errorf("deepseek call failed: %w", err)
 	}
@@ -552,6 +569,11 @@ type ConsultInput struct {
 	ExplorerSystemPrompt string `json:"explorer_system_prompt,omitempty" jsonschema:"optional system prompt override for the explore phase; takes precedence over the dpal-configured explorer default."`
 	DisableExplore       bool   `json:"disable_explore,omitempty" jsonschema:"set true to skip the explore phase for this call and send the prompt directly to the synthesizer model. Useful when the caller has already curated context."`
 	Thinking             *bool  `json:"thinking,omitempty" jsonschema:"optional override for V4 thinking mode on the synthesizer call; defaults to true. Set false for fast non-thinking synthesis. The explorer phase never uses thinking mode regardless of this setting."`
+	// ReasoningEffort tunes the synthesizer's thinking-mode deliberation.
+	// Applies only to the synth call; the explorer never gets it (explore
+	// is pattern-match-and-load, not deep reasoning). Passed through to
+	// DeepSeek unmodified; empty means the model default.
+	ReasoningEffort string `json:"reasoning_effort,omitempty" jsonschema:"optional reasoning_effort for the synthesizer's thinking mode (e.g. \"high\" or \"max\"); passed through to DeepSeek. Applies to the synth call only, never the explorer. Omit to use the model default."`
 }
 
 type ConsultOutput struct {
@@ -641,7 +663,7 @@ func (s *Server) Consult(
 			explorerSys = synthSysPrompt
 		}
 
-		_, withExploration, err := s.chat(ctx, explorerModel, explorerSys, exp, candidate, false)
+		_, withExploration, err := s.chat(ctx, explorerModel, explorerSys, exp, candidate, false, "")
 		if err != nil {
 			return nil, ConsultOutput{}, fmt.Errorf("deepseek explore phase failed: %w", err)
 		}
@@ -662,7 +684,7 @@ func (s *Server) Consult(
 	// Phase 2: synthesize. No tools advertised — the synthesizer reads
 	// whatever the explorer loaded into the candidate transcript and
 	// writes a final answer.
-	resp, updated, err := s.chat(ctx, synthModel, synthSysPrompt, nil, candidate, enableThinking)
+	resp, updated, err := s.chat(ctx, synthModel, synthSysPrompt, nil, candidate, enableThinking, in.ReasoningEffort)
 	if err != nil {
 		return nil, ConsultOutput{}, fmt.Errorf("deepseek synthesize phase failed: %w", err)
 	}

@@ -62,6 +62,7 @@ Per-call overrides on `consult_deepseek`:
 | `explorer_system_prompt` | built-in explorer prompt | explorer's system prompt for this call |
 | `disable_explore` | `false` | skip the explore phase entirely for this call |
 | `thinking` | `true` | V4 thinking mode on the synth call; set `false` for fast non-thinking responses. The explorer phase never uses thinking regardless of this setting. |
+| `reasoning_effort` | model default | tune thinking-mode deliberation, e.g. `"high"` or `"max"`; passed through to DeepSeek. Applies to the synth call only, never the explorer. |
 
 If you want a stateful conversation without the explore phase, set
 `disable_explore: true` per call. If you want a stateless, direct call,

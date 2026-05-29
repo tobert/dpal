@@ -57,12 +57,6 @@ concrete. When an item ships, delete the entry.
   Acceptable today — the agentic value outweighs the cache cost — but
   worth measuring if a heavy user complains.
 
-- **No `reasoning_effort` knob.** V4 supports `reasoning_effort` =
-  `"high"`/`"max"` on thinking-mode calls; deepseek-go exposes it via
-  `ExtraFields`. We hardcode the model default (whatever it is). Add a
-  per-call `reasoning_effort` field to `ConsultInput`/`OneshotInput`
-  when someone wants to tune for deeper or shallower thinking.
-
 - **`sess.reasoning` duplicates `sess.messages[*].ReasoningContent`.**
   After the V4 rule flip, `reasoning_content` lives on the assistant
   message itself for replay. The parallel `sess.reasoning` array is
