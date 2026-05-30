@@ -180,6 +180,151 @@ func TestReadFile_EmptyFile(t *testing.T) {
 	}
 }
 
+func TestReadFile_NumbersLines(t *testing.T) {
+	// read_file prefixes each line with its number (cat -n style) so a
+	// reading model can cite real line numbers instead of eyeballing them.
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "multi.txt", "alpha\nbeta\ngamma\n")
+	out, err := exp.ReadFile("multi.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"1\talpha", "2\tbeta", "3\tgamma"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("read_file output missing line-numbered %q:\n%s", want, out)
+		}
+	}
+	// The trailing newline must not produce a phantom numbered line 4.
+	if strings.Contains(out, "4\t") {
+		t.Errorf("trailing newline should not yield a numbered empty line 4:\n%s", out)
+	}
+	// The byte-count header reports the true file size, unaffected by numbering.
+	if !strings.Contains(out, "17 bytes") {
+		t.Errorf("expected true 17-byte size header:\n%s", out)
+	}
+}
+
+func TestReadFileRange_ReturnsRequestedLines(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "ten.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n")
+	out, err := exp.ReadFileRange("ten.txt", 3, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"3\tl3", "4\tl4", "5\tl5"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("range read missing %q:\n%s", want, out)
+		}
+	}
+	for _, no := range []string{"2\tl2", "6\tl6"} {
+		if strings.Contains(out, no) {
+			t.Errorf("range read leaked out-of-range line %q:\n%s", no, out)
+		}
+	}
+}
+
+func TestReadFileRange_ReachesPastHeadCap(t *testing.T) {
+	// The case that motivated ranged reads: target lines sit beyond the
+	// head byte cap that plain ReadFile stops at. The range read must
+	// still reach them, with their true (absolute) line numbers.
+	exp, dir := newTestExplorer(t)
+	exp.maxFileBytes = 1024 // tiny head cap to stand in for a "huge file"
+	var sb strings.Builder
+	for i := 1; i <= 500; i++ {
+		fmt.Fprintf(&sb, "line %d padding padding padding\n", i)
+	}
+	writeFile(t, dir, "big.txt", sb.String())
+
+	out, err := exp.ReadFileRange("big.txt", 400, 401)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "400\tline 400") {
+		t.Errorf("ranged read did not reach line 400 past the head cap:\n%s", out)
+	}
+	// Sanity: plain ReadFile is head-capped and must NOT see line 400.
+	head, err := exp.ReadFile("big.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(head, "line 400") {
+		t.Errorf("head read unexpectedly reached line 400; the cap isn't holding")
+	}
+}
+
+func TestReadFileRange_StartOnlyReadsToEOF(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "five.txt", "a\nb\nc\nd\ne\n")
+	out, err := exp.ReadFileRange("five.txt", 4, 0) // end unset → to EOF
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "4\td") || !strings.Contains(out, "5\te") {
+		t.Errorf("start-only range should read to EOF:\n%s", out)
+	}
+	if strings.Contains(out, "3\tc") {
+		t.Errorf("start-only range leaked a line before start:\n%s", out)
+	}
+}
+
+func TestReadFileRange_SingleLineExceedsCap(t *testing.T) {
+	// A minified/generated file whose first in-range line is bigger than
+	// the byte cap: the header must say the line is too large, NOT claim
+	// to show "lines N-N" with an empty body (the misleading-header bug).
+	exp, dir := newTestExplorer(t)
+	exp.maxFileBytes = 64
+	writeFile(t, dir, "min.js", "tiny\n"+strings.Repeat("x", 500)+"\n")
+	out, err := exp.ReadFileRange("min.js", 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "lines 2-2") {
+		t.Errorf("header should not claim to show line 2 when it was too big to include:\n%s", out)
+	}
+	if !strings.Contains(out, "exceeds") {
+		t.Errorf("header should say the line exceeds the cap:\n%s", out)
+	}
+}
+
+func TestReadFileRange_TruncationHeaderCountsIncludedLines(t *testing.T) {
+	// When the window is truncated partway, the header's upper bound must
+	// be the last line actually INCLUDED, not the line that didn't fit.
+	exp, dir := newTestExplorer(t)
+	exp.maxFileBytes = 40 // a couple of short lines fit; then it cuts off
+	writeFile(t, dir, "many.txt", "aaaa\nbbbb\ncccc\ndddd\neeee\n")
+	out, err := exp.ReadFileRange("many.txt", 1, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "truncated") {
+		t.Fatalf("expected truncation for a window past the cap:\n%s", out)
+	}
+	// Find the last numbered line present and confirm the header agrees.
+	if strings.Contains(out, "lines 1-5") {
+		t.Errorf("header claims lines 1-5 but the window was truncated before line 5:\n%s", out)
+	}
+}
+
+func TestReadFileRange_RejectsBadRange(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "x.txt", "a\nb\n")
+	if _, err := exp.ReadFileRange("x.txt", 5, 2); err == nil {
+		t.Error("expected error when end_line < start_line")
+	}
+}
+
+func TestDispatch_ReadFileWithRange(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "r.txt", "one\ntwo\nthree\nfour\n")
+	out := exp.Dispatch("read_file", `{"path":"r.txt","start_line":2,"end_line":3}`)
+	if !strings.Contains(out, "2\ttwo") || !strings.Contains(out, "3\tthree") {
+		t.Errorf("dispatch ranged read wrong:\n%s", out)
+	}
+	if strings.Contains(out, "four") {
+		t.Errorf("dispatch ranged read leaked an out-of-range line:\n%s", out)
+	}
+}
+
 func TestReadFile_RejectsDirectory(t *testing.T) {
 	exp, dir := newTestExplorer(t)
 	if err := os.Mkdir(filepath.Join(dir, "d"), 0o755); err != nil {

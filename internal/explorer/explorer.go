@@ -6,6 +6,7 @@
 package explorer
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -196,11 +197,131 @@ func (e *Explorer) ReadFile(path string) (string, error) {
 	rel, _ := filepath.Rel(e.root, target)
 	var b strings.Builder
 	fmt.Fprintf(&b, "file %s (%d bytes)\n---\n", rel, info.Size())
-	b.Write(data)
+	b.WriteString(numberLines(data))
 	if int64(len(data)) < info.Size() {
-		fmt.Fprintf(&b, "\n--- (truncated; first %d of %d bytes shown)\n", len(data), info.Size())
+		fmt.Fprintf(&b, "--- (truncated; first %d of %d bytes shown)\n", len(data), info.Size())
 	}
 	return b.String(), nil
+}
+
+// numberLines prefixes each line of data with its 1-based line number in
+// cat -n style ("%6d\t"), so a reading model can cite real line numbers
+// rather than counting by eye. A trailing newline does not produce a
+// phantom final line. Returns "" for empty input.
+func numberLines(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	s := string(data)
+	lines := strings.Split(s, "\n")
+	// strings.Split on a trailing newline yields a final "" element;
+	// drop it so the EOF newline isn't numbered as its own line.
+	if strings.HasSuffix(s, "\n") {
+		lines = lines[:len(lines)-1]
+	}
+	var b strings.Builder
+	for i, ln := range lines {
+		fmt.Fprintf(&b, "%6d\t%s\n", i+1, ln)
+	}
+	return b.String()
+}
+
+// ReadFileRange reads lines [startLine, endLine] (1-based, inclusive) of
+// the file at path. startLine <= 0 defaults to 1; endLine <= 0 reads to
+// EOF. Unlike ReadFile, which stops at the head byte cap, this streams
+// line by line and can reach lines deep in a large file — it is how the
+// curator (and the synthesizer) excerpt a precise window the head read
+// can't reach. The returned window is still capped at maxFileBytes and
+// truncated with a marker if it overflows. Each line keeps its true,
+// absolute line number.
+func (e *Explorer) ReadFileRange(path string, startLine, endLine int) (string, error) {
+	if startLine <= 0 {
+		startLine = 1
+	}
+	if endLine > 0 && endLine < startLine {
+		return "", fmt.Errorf("read_file %q: end_line %d is before start_line %d", path, endLine, startLine)
+	}
+
+	target, err := e.resolve(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return "", fmt.Errorf("read_file %q: %w", path, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("read_file %q: is a directory", path)
+	}
+
+	f, err := os.Open(target)
+	if err != nil {
+		return "", fmt.Errorf("read_file %q: %w", path, err)
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	// Allow lines far longer than the 64 KiB default token so a minified
+	// or generated line doesn't abort the scan.
+	sc.Buffer(make([]byte, 0, 64*1024), int(e.maxSearchBytes))
+
+	var body strings.Builder
+	var bodyBytes int64
+	lineNo := 0
+	lastWritten := 0 // highest line number actually included in body
+	truncated := false
+	for sc.Scan() {
+		lineNo++
+		if lineNo < startLine {
+			continue
+		}
+		if endLine > 0 && lineNo > endLine {
+			break
+		}
+		line := sc.Text()
+		entry := fmt.Sprintf("%6d\t%s\n", lineNo, line)
+		if bodyBytes+int64(len(entry)) > e.maxFileBytes {
+			truncated = true
+			break
+		}
+		body.WriteString(entry)
+		bodyBytes += int64(len(entry))
+		lastWritten = lineNo
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("read_file %q: %w", path, err)
+	}
+
+	var b strings.Builder
+	if body.Len() == 0 {
+		if truncated {
+			// The first in-range line was itself larger than the byte cap,
+			// so nothing could be shown. Say so plainly rather than claim an
+			// empty "lines N-N" window.
+			fmt.Fprintf(&b, "file %s (line %d exceeds the %d-byte read cap; too large to show)\n---\n", e.rel(target), startLine, e.maxFileBytes)
+		} else {
+			// Range began past EOF. lineNo is the file's total line count.
+			fmt.Fprintf(&b, "file %s (no lines in range; file has %d lines)\n---\n", e.rel(target), lineNo)
+		}
+		return b.String(), nil
+	}
+	// Header's upper bound is the last line actually included, not the line
+	// that overflowed the cap (which is excluded).
+	fmt.Fprintf(&b, "file %s (lines %d-%d)\n---\n", e.rel(target), startLine, lastWritten)
+	b.WriteString(body.String())
+	if truncated {
+		fmt.Fprintf(&b, "--- (truncated at %d bytes; request a narrower range)\n", e.maxFileBytes)
+	}
+	return b.String(), nil
+}
+
+// rel returns target's path relative to the sandbox root for display.
+func (e *Explorer) rel(target string) string {
+	r, err := filepath.Rel(e.root, target)
+	if err != nil {
+		return target
+	}
+	return r
 }
 
 // readCapped returns up to max bytes from path, surfacing every read
@@ -406,6 +527,9 @@ func (e *Explorer) ToolDefinitions() []deepseek.Tool {
 	stringProp := func(desc string) map[string]any {
 		return map[string]any{"type": "string", "description": desc}
 	}
+	intProp := func(desc string) map[string]any {
+		return map[string]any{"type": "integer", "description": desc}
+	}
 	return []deepseek.Tool{
 		{
 			Type: "function",
@@ -425,11 +549,13 @@ func (e *Explorer) ToolDefinitions() []deepseek.Tool {
 			Type: "function",
 			Function: deepseek.Function{
 				Name:        "read_file",
-				Description: "Read the contents of a file under the project root. Large files are truncated; see the trailing marker.",
+				Description: "Read a file under the project root. Each line is prefixed with its line number (cat -n style); cite those numbers directly. With no range, reads from the top and large files are truncated (see the trailing marker). Pass start_line/end_line to read a precise window — this reaches lines past the head cap, so it's how you excerpt deep into a large file.",
 				Parameters: &deepseek.FunctionParameters{
 					Type: "object",
 					Properties: map[string]any{
-						"path": stringProp("File path, relative to the project root."),
+						"path":       stringProp("File path, relative to the project root."),
+						"start_line": intProp("Optional 1-based first line to read. Omit to start at the top."),
+						"end_line":   intProp("Optional 1-based last line to read (inclusive). Omit to read to end of file."),
 					},
 					Required: []string{"path"},
 				},
@@ -488,12 +614,24 @@ func (e *Explorer) Dispatch(name string, argsJSON string) string {
 		return out
 	case "read_file":
 		var args struct {
-			Path string `json:"path"`
+			Path      string `json:"path"`
+			StartLine int    `json:"start_line"`
+			EndLine   int    `json:"end_line"`
 		}
 		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 			return fmt.Sprintf("error: invalid arguments for read_file: %v", err)
 		}
-		out, err := e.ReadFile(args.Path)
+		// A line range (either bound) routes to the streaming ranged read,
+		// which can reach past the head byte cap; otherwise read from the top.
+		var (
+			out string
+			err error
+		)
+		if args.StartLine > 0 || args.EndLine > 0 {
+			out, err = e.ReadFileRange(args.Path, args.StartLine, args.EndLine)
+		} else {
+			out, err = e.ReadFile(args.Path)
+		}
 		if err != nil {
 			return "error: " + err.Error()
 		}

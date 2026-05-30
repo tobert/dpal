@@ -7,12 +7,10 @@ import (
 	deepseek "github.com/cohesion-org/deepseek-go"
 )
 
-// The synthesizer is handed the explorer's tool-call transcript but must not
-// itself call tools. Relying on omitting `tools` to mean "don't call tools"
-// is an inconsistent request (the history references tool calls) and primes
-// the model to emit tool-call markup that leaks into Content. The protocol's
-// purpose-built knob is tool_choice:"none"; assert the synth sends it.
-func TestConsult_SynthSetsToolChoiceNone(t *testing.T) {
+// In the disable_explore / direct path there is no explorer pass: the
+// caller has curated the context, so the synth call advertises no tools
+// and sends tool_choice:"none" to keep it from emitting tool-call markup.
+func TestConsult_DirectSynthSetsToolChoiceNone(t *testing.T) {
 	rec := &recordingClient{responses: []*deepseek.ChatCompletionResponse{makeResp("ok", "")}}
 	s := New(rec)
 
@@ -22,13 +20,15 @@ func TestConsult_SynthSetsToolChoiceNone(t *testing.T) {
 		t.Fatal(err)
 	}
 	if rec.requests[0].ToolChoice != "none" {
-		t.Errorf("synth tool_choice = %v, want \"none\"", rec.requests[0].ToolChoice)
+		t.Errorf("direct synth tool_choice = %v, want \"none\"", rec.requests[0].ToolChoice)
 	}
 }
 
-// The explorer phase is the whole point of the tool loop, so it must NOT be
-// constrained with tool_choice:"none" — only the synth call is.
-func TestConsult_ExplorerDoesNotGetToolChoiceNone(t *testing.T) {
+// When the explore phase runs, NEITHER call is constrained with
+// tool_choice:"none": the explorer drives the tool loop, and the synth is
+// now free to fetch beyond the report (auto tool_choice), so it must not
+// be pinned to "none".
+func TestConsult_NeitherPhaseGetsToolChoiceNoneWhenExploreRan(t *testing.T) {
 	rec := &recordingClient{responses: []*deepseek.ChatCompletionResponse{
 		makeResp("explorer's draft answer", ""), // explore phase ends immediately (no tool calls)
 		makeResp("synth answer", ""),
@@ -46,8 +46,8 @@ func TestConsult_ExplorerDoesNotGetToolChoiceNone(t *testing.T) {
 	if rec.requests[0].ToolChoice == "none" {
 		t.Errorf("explorer tool_choice = %v, want unset (explorer must be free to call tools)", rec.requests[0].ToolChoice)
 	}
-	if rec.requests[1].ToolChoice != "none" {
-		t.Errorf("synth tool_choice = %v, want \"none\"", rec.requests[1].ToolChoice)
+	if rec.requests[1].ToolChoice == "none" {
+		t.Errorf("synth tool_choice = %v, want unset (synth may fetch beyond the report)", rec.requests[1].ToolChoice)
 	}
 }
 

@@ -353,10 +353,10 @@ func (s *Server) callAttempt(
 	if len(tools) > 0 {
 		req.Tools = tools
 	}
-	// tool_choice lets the caller forbid tool use ("none") even when the
-	// message history references prior tool calls. The synth phase uses
-	// this: it is fed the explorer's tool-call transcript but must answer,
-	// not call tools. Omitting it (empty) leaves the model's default.
+	// tool_choice lets the caller forbid tool use ("none"). The direct /
+	// disable_explore synth path uses it to answer without tools; the
+	// explore-ran synth path omits it (empty) so V4-Pro may fetch beyond
+	// the report. Omitting it leaves the model's default.
 	if toolChoice != "" {
 		req.ToolChoice = toolChoice
 	}
@@ -622,16 +622,17 @@ type ConsultOutput struct {
 }
 
 // Consult is the stateful, agentic chat tool. By default it runs two
-// phases: a cheap explorer model (deepseek-v4-flash)
-// drives the tool loop to load relevant code and context, then a
-// stronger synthesizer model (deepseek-v4-pro, thinking) takes the
-// loaded message history and writes the final answer. The explorer's
-// own text-only synthesis attempt is stripped before the synthesizer
-// is called so the synthesizer doesn't just defer to it.
+// phases: a cheap explorer model (deepseek-v4-flash) drives the tool loop
+// to load relevant code, then writes a curated report of its findings; a
+// stronger synthesizer model (deepseek-v4-pro, thinking) reads that report
+// — folded into its prompt as reference context — and writes the final
+// answer. The raw tool transcript is discarded at the hand-off; only the
+// report crosses (extractExplorerReport). The synthesizer also gets the
+// explorer's tools so it can fetch a precise span the report didn't quote.
 //
 // If --no-explore is set or DisableExplore is true on the input, the
-// explore phase is skipped and the synthesizer is called directly.
-// Errors during either phase abort the whole call and leave the
+// explore phase is skipped and the synthesizer is called directly, with no
+// tools. Errors during either phase abort the whole call and leave the
 // session's durable history untouched.
 func (s *Server) Consult(
 	ctx context.Context,
@@ -695,19 +696,22 @@ func (s *Server) Consult(
 	exp := s.explorerForRequest(ctx, req)
 
 	// Phase 1: explore. Skipped if there's no explorer (--no-explore) or
-	// the caller opted out. The explorer's tool exchanges land in
-	// `candidate` for the synthesizer to read; the explorer's own final
-	// text answer is dropped so the synthesizer doesn't anchor on it.
+	// the caller opted out. The explorer runs the tool loop to load files,
+	// then writes a CURATED REPORT of its findings (its final text turn).
+	// That report — not the raw tool-call transcript — is what the
+	// synthesizer receives: the explorer summarizes the repo tree, quotes
+	// the spans that matter, and drops what it opened by mistake, so the
+	// pro model reads signal instead of a 90KB dump. The raw transcript
+	// and the explorer's reasoning are discarded at the hand-off (see
+	// extractExplorerReport).
 	//
 	// The explorer runs WITH V4 thinking mode. Since project_tree, the
 	// explorer's job is no longer pattern-match-and-load — it sees the whole
 	// file map and must reason about which handful of files the answer
-	// actually depends on. That selection is a judgment task, and a
-	// non-thinking model defaults to reading everything; a little thinking is
-	// far cheaper than the unnecessary whole-file reads it prevents. The
-	// explorer's reasoning is stripped before the synth call (see
-	// stripExplorerSynthesis) so it never reaches the pro model's context.
+	// actually depends on, then how to curate them. That is a judgment task,
+	// and a non-thinking model defaults to reading (and dumping) everything.
 	var explorerToolCalls int
+	var explorerReport string
 	usedExplorer := ""
 	if exp != nil && !in.DisableExplore {
 		explorerSys := s.explorerSystemPrompt
@@ -730,8 +734,11 @@ func (s *Server) Consult(
 			return nil, ConsultOutput{}, fmt.Errorf("deepseek explore phase failed: %w", err)
 		}
 
-		candidate, explorerToolCalls = stripExplorerSynthesis(withExploration, len(candidate))
-		exploreSpan.SetAttributes(attribute.Int("dpal.explorer_tool_calls", explorerToolCalls))
+		explorerReport, explorerToolCalls = extractExplorerReport(withExploration, len(candidate))
+		exploreSpan.SetAttributes(
+			attribute.Int("dpal.explorer_tool_calls", explorerToolCalls),
+			attribute.Int("dpal.explorer_report_bytes", len(explorerReport)),
+		)
 		exploreSpan.End()
 		usedExplorer = explorerModel
 	}
@@ -745,16 +752,36 @@ func (s *Server) Consult(
 		enableThinking = *in.Thinking
 	}
 
-	// Phase 2: synthesize. No tools advertised — the synthesizer reads
-	// whatever the explorer loaded into the candidate transcript and
-	// writes a final answer. tool_choice="none" forbids it from trying to
-	// continue the tool loop: the candidate carries the explorer's
-	// tool-call transcript, which otherwise primes the model to emit a
-	// tool call that (with no tools advertised) leaks as raw markup into
-	// the answer content.
+	// Build the synthesizer's input: the candidate transcript with the
+	// explorer's report folded into the final user message as reference
+	// context. `candidate` itself stays the clean prompt — it is the base
+	// for the durable session history, which never carries the report.
+	synthInput := candidate
+	if explorerReport != "" {
+		synthInput = make([]deepseek.ChatCompletionMessage, len(candidate))
+		copy(synthInput, candidate)
+		last := &synthInput[len(synthInput)-1]
+		last.Content += exploreContextPreamble + explorerReport
+	}
+
+	// Phase 2: synthesize. The synthesizer answers from the report folded
+	// into its prompt — but when the explore phase ran, it also gets the
+	// explorer's tools (tool_choice auto) so it can read_file/search_project
+	// to fetch a precise span the report's index pointed to but didn't quote
+	// in full. The report stays primary; the tools are the fallback for when
+	// it's missing something. With --no-explore / disable_explore there was
+	// no explorer pass, so the synthesizer answers directly with no tools
+	// (tool_choice="none"), matching that mode's "caller curated the context"
+	// intent.
+	var synthExp *explorer.Explorer
+	synthToolChoice := toolChoiceNone
+	if exp != nil && !in.DisableExplore {
+		synthExp = exp
+		synthToolChoice = ""
+	}
 	synthCtx, synthSpan := s.tracer.Start(ctx, "dpal.synthesize",
 		trace.WithAttributes(attribute.String("gen_ai.request.model", synthModel)))
-	resp, updated, err := s.chat(synthCtx, synthModel, synthSysPrompt, nil, candidate, enableThinking, in.ReasoningEffort, toolChoiceNone)
+	resp, _, err := s.chat(synthCtx, synthModel, synthSysPrompt, synthExp, synthInput, enableThinking, in.ReasoningEffort, synthToolChoice)
 	if err != nil {
 		synthSpan.SetStatus(codes.Error, err.Error())
 		synthSpan.End()
@@ -766,8 +793,16 @@ func (s *Server) Consult(
 	}
 	synthSpan.End()
 
-	sess.messages = updated
+	// Persist lean history: prior turns + this turn's user prompt + the
+	// synth answer. The exploration report was ephemeral context for this
+	// turn's synth call only; it is not stored. Each turn re-explores
+	// fresh, so old reports would just be stale bloat.
 	msg := resp.Choices[0].Message
+	sess.messages = append(candidate, deepseek.ChatCompletionMessage{
+		Role:             deepseek.ChatMessageRoleAssistant,
+		Content:          msg.Content,
+		ReasoningContent: msg.ReasoningContent,
+	})
 
 	turnCount := 0
 	for _, m := range sess.messages {
@@ -804,43 +839,68 @@ func (s *Server) Consult(
 	}, out, nil
 }
 
-// stripExplorerSynthesis drops the explorer's final text-only assistant
-// message (which is its attempt at answering — we want the synthesizer
-// to write the answer instead) while keeping every tool_call/tool pair
-// the explorer issued. originalLen is the length of the candidate
-// before the explorer ran; messages at that index or later are
-// explorer-produced and subject to stripping.
+// Markers the explorer wraps its report in, and the framing under which
+// that report is folded into the synthesizer's prompt. The preamble
+// wording is deliberate: the report is reference material gathered from
+// the codebase, NOT a draft answer — the synthesizer must write its own
+// response and treat the report as sources to reason over, not a
+// conclusion to ratify.
+const (
+	exploreReportBeginMarker = "BEGIN EXPLORATION"
+	exploreReportEndMarker   = "END OF EXPLORATION"
+	exploreContextPreamble   = "\n\n---\nThe following context was gathered from the codebase by an exploration assistant to help you answer. It is reference material, not a draft answer: write your own response from it, and cite the file:line locations it points to. If it points to a location it did not quote in full and you need the exact text, read it yourself with read_file (use start_line/end_line for a precise window).\n\n"
+)
+
+// extractExplorerReport pulls the explorer's curated report out of the
+// explore-phase transcript and returns how many tool calls the explorer
+// made. originalLen is the length of the candidate before the explorer
+// ran; messages at that index or later are explorer-produced.
 //
-// It also omits the explorer's reasoning_content from those turns. The
-// explorer now runs with thinking on, but its deliberation about which
-// files to load is noise for the synthesizer (a different model, no tools)
-// and would bloat the pro model's context. The explore loop already
-// consumed that reasoning internally for its own multi-turn replay; once we
-// hand the transcript to the synth, we drop it — which also matches the
-// pre-thinking behavior, where the explorer produced no reasoning at all.
-// Only explorer-range turns are touched, so prior synth reasoning (which V4
-// requires replayed) is preserved.
+// The report is the explorer's final text-only assistant message — its
+// curated findings, which the synthesizer reads in place of the raw
+// tool-call transcript. The whole transcript (tool calls, file dumps,
+// the explorer's reasoning_content) is discarded: only the report
+// crosses to the synthesizer.
 //
-// Also returns the count of tool calls the explorer made, summed across
-// all of its assistant turns.
-func stripExplorerSynthesis(msgs []deepseek.ChatCompletionMessage, originalLen int) ([]deepseek.ChatCompletionMessage, int) {
-	toolCalls := 0
+// When the explorer made zero tool calls it loaded no context, so there
+// is nothing to hand off and the report is empty regardless of what the
+// model said (e.g. "No exploration needed.").
+func extractExplorerReport(msgs []deepseek.ChatCompletionMessage, originalLen int) (report string, toolCalls int) {
 	for i := originalLen; i < len(msgs); i++ {
 		if msgs[i].Role == deepseek.ChatMessageRoleAssistant {
 			toolCalls += len(msgs[i].ToolCalls)
 		}
-		msgs[i].ReasoningContent = ""
 	}
-	// chat() always appends a final text-only assistant message when
-	// the loop terminates normally (FinishReason != tool_calls). Strip
-	// it. Defensive: only strip if it actually matches that shape.
-	if n := len(msgs); n > 0 {
-		last := msgs[n-1]
-		if last.Role == deepseek.ChatMessageRoleAssistant && len(last.ToolCalls) == 0 {
-			return msgs[:n-1], toolCalls
-		}
+	if toolCalls == 0 {
+		return "", 0
 	}
-	return msgs, toolCalls
+	// toolCalls > 0 implies at least one explorer-produced message, so msgs
+	// is non-empty here. chat() always ends on an assistant turn; when that
+	// turn carries no tool calls it's the explorer's final report.
+	last := msgs[len(msgs)-1]
+	if last.Role == deepseek.ChatMessageRoleAssistant && len(last.ToolCalls) == 0 {
+		return cleanReport(last.Content), toolCalls
+	}
+	return "", toolCalls
+}
+
+// cleanReport returns the body of an explorer report. If the report
+// carries BEGIN/END EXPLORATION markers, only the text between them is
+// returned — the explorer sometimes leaks a preamble before the marker
+// ("I have everything I need. Here is the report."), and this discards
+// it. Without a BEGIN marker, the whole trimmed content is used.
+//
+// If BEGIN is present but END is missing (a clipped or malformed report),
+// everything after BEGIN is kept: losing the report entirely is worse than
+// admitting a little trailing chatter, and the synthesizer is told the
+// block is reference material either way.
+func cleanReport(s string) string {
+	_, rest, found := strings.Cut(s, exploreReportBeginMarker)
+	if !found {
+		return strings.TrimSpace(s)
+	}
+	body, _, _ := strings.Cut(rest, exploreReportEndMarker)
+	return strings.TrimSpace(body)
 }
 
 func (s *Server) Register(mcpServer *mcp.Server) {
@@ -854,8 +914,9 @@ func (s *Server) Register(mcpServer *mcp.Server) {
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "consult_deepseek",
 		Description: "Agentic, stateful DeepSeek V4 consultation. Two phases by default: " +
-			"a cheap explorer model (deepseek-v4-flash) reads files via tool calls to load context, " +
-			"then a stronger synthesizer model (deepseek-v4-pro with thinking) writes the answer. " +
+			"a cheap explorer model (deepseek-v4-flash) reads files via tool calls and writes a curated report, " +
+			"then a stronger synthesizer model (deepseek-v4-pro with thinking) answers from that report and can " +
+			"read more on its own if it needs to. " +
 			"BOTH MODELS ARE BILLED. Conversation is keyed by session_id; reuse to continue. " +
 			"Set disable_explore=true to skip the explore phase, or use consult_deepseek_oneshot for a single direct call.",
 	}, s.Consult)

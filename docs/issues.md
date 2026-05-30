@@ -34,6 +34,32 @@ concrete. When an item ships, delete the entry.
   receiver in-process. Low priority until the otelinit package grows
   more logic.
 
+## Report hand-off follow-ups
+
+- **Validate report quality vs. the raw dump (the deferred head-to-head).**
+  The explorer now hands the synthesizer a curated report instead of the
+  raw tool transcript (`extractExplorerReport`), ~7-15% of the bytes. The
+  explorer-report experiment (`internal/server/explorer_report_experiment_test.go`)
+  validated the report *in isolation* and looked good, but the decisive
+  test — same question, pro fed (a) raw transcript vs (b) report, compare
+  the two final answers — was deferred. Run it before trusting the report
+  path on hard questions; it's the evidence that flash's curation isn't
+  dropping needles. (The experiment file's prompts/comments still name the
+  retired `stripExplorerSynthesis`; refresh or retire it when you do this.)
+
+- **Report is invisible in `dpal://session`.** Sessions persist lean
+  `[user, answer]` now; the per-turn report is ephemeral. There's a
+  `dpal.explorer_report_bytes` span attribute but no way to read the
+  report itself after the fact. If that visibility matters, surface the
+  last report via a debug resource rather than bloating durable history.
+
+- **Synth fetches are pro-priced.** The synthesizer can now `read_file`/
+  `search_project` to fill gaps in the report (Option-2 hybrid), but each
+  fetch is a `deepseek-v4-pro` tool iteration — expensive. Fine as a
+  safety net; watch the counts. If pro over-fetches, tighten the synth
+  system-prompt nudge or give the synth tool loop its own (smaller)
+  iteration cap separate from the explorer's 25.
+
 ## Productivity / DX
 
 - **No streaming.** `CreateChatCompletion` blocks until the full
@@ -41,7 +67,8 @@ concrete. When an item ships, delete the entry.
   reasoning-heavy prompts with no visible progress. deepseek-go
   exposes streaming; need to thread `Server.chat` through it and add
   an MCP progress-notification path. Especially painful now that the
-  two-phase default doubles the silent wait time.
+  two-phase default doubles the silent wait time — and the synth phase
+  can add its own tool-loop round-trips on top.
 
 - **No stateful + non-agentic tool.** Today the matrix has
   `consult_deepseek` (stateful + agentic) and `consult_deepseek_oneshot`

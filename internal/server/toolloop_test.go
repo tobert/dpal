@@ -110,22 +110,33 @@ func TestExplorePhase_DispatchesToolCallAndRecalls(t *testing.T) {
 		t.Errorf("tool result did not include file body: %q", exploreRecall[2].Content)
 	}
 
-	// Synth: same user + tool exchanges WITHOUT the explorer's text answer.
+	// Synth: the explorer's curated report is folded into the user prompt;
+	// the raw tool transcript does NOT cross over.
 	synth := rec.requests[2].Messages
-	if len(synth) != 3 {
-		t.Fatalf("synth messages = %d, want 3 (user, assistant-tool_calls, tool); explorer's text should have been stripped", len(synth))
+	if len(synth) != 1 {
+		t.Fatalf("synth messages = %d, want 1 (the user prompt with the report folded in)", len(synth))
+	}
+	if synth[0].Role != deepseek.ChatMessageRoleUser {
+		t.Errorf("synth[0] role = %q, want user", synth[0].Role)
+	}
+	if !strings.Contains(synth[0].Content, "Please read note.txt") {
+		t.Errorf("synth user message lost the original prompt: %q", synth[0].Content)
+	}
+	if !strings.Contains(synth[0].Content, "Exploration complete.") {
+		t.Errorf("synth user message missing the explorer report: %q", synth[0].Content)
 	}
 	for _, m := range synth {
-		if m.Role == deepseek.ChatMessageRoleAssistant && m.Content == "Exploration complete." {
-			t.Errorf("explorer's text synthesis leaked into synth request: %+v", m)
+		if m.Role == "tool" || len(m.ToolCalls) > 0 {
+			t.Errorf("raw tool transcript leaked into synth request: %+v", m)
 		}
 	}
 }
 
-// TestExplorePhase_NoToolsAdvertisedDuringSynth verifies the synth call
-// has Tools=nil. The synthesizer should be reading exploration results,
-// not running further tool calls itself.
-func TestExplorePhase_NoToolsAdvertisedDuringSynth(t *testing.T) {
+// TestExplorePhase_SynthGetsToolsWhenExploreRan verifies the synth call
+// is offered the explorer's tools (auto tool_choice) so it can fetch a
+// precise span the report didn't quote. This is the Option-2 hybrid: the
+// report is primary, the tools are the fallback.
+func TestExplorePhase_SynthGetsToolsWhenExploreRan(t *testing.T) {
 	exp := newSandboxExplorer(t)
 	rec := &recordingClient{
 		responses: []*deepseek.ChatCompletionResponse{
@@ -144,8 +155,73 @@ func TestExplorePhase_NoToolsAdvertisedDuringSynth(t *testing.T) {
 	if len(rec.requests[0].Tools) != 4 {
 		t.Errorf("explore phase Tools = %d, want 4", len(rec.requests[0].Tools))
 	}
-	if len(rec.requests[1].Tools) != 0 {
-		t.Errorf("synth phase Tools = %d, want 0 (no tools in synth)", len(rec.requests[1].Tools))
+	if len(rec.requests[1].Tools) != 4 {
+		t.Errorf("synth phase Tools = %d, want 4 (synth may fetch beyond the report)", len(rec.requests[1].Tools))
+	}
+}
+
+// TestConsult_SynthCanFetchBeyondReport — the Option-2 hybrid end to end:
+// the explorer hands over a report that points at note.txt without
+// quoting it, the synthesizer reads the file itself to get the exact
+// text, and the answer reflects it. Crucially, the synth's own tool
+// exchange does NOT persist — durable history stays lean [user, answer].
+func TestConsult_SynthCanFetchBeyondReport(t *testing.T) {
+	exp := newSandboxExplorer(t) // note.txt contains "hello there"
+	rec := &recordingClient{
+		responses: []*deepseek.ChatCompletionResponse{
+			// Explore: load note.txt, then report a pointer (no full quote).
+			toolCallResp("read_file", `{"path":"note.txt"}`, "c1"),
+			finalResp("BEGIN EXPLORATION\nnote.txt:1 holds a greeting; read it for the exact wording\nEND OF EXPLORATION"),
+			// Synth: pro decides it needs the exact text and reads the file.
+			toolCallResp("read_file", `{"path":"note.txt"}`, "s1"),
+			// Synth: final answer after the fetch.
+			finalResp("The note says hello there."),
+		},
+	}
+	s := New(rec).WithExplorer(exp)
+
+	_, out, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "what exactly does the note say?"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 4 upstream calls: explore-1 (tool), explore-2 (report), synth-1 (tool), synth-2 (final).
+	if len(rec.requests) != 4 {
+		t.Fatalf("expected 4 upstream calls, got %d", len(rec.requests))
+	}
+	if len(rec.requests[2].Tools) != 4 {
+		t.Errorf("synth phase should advertise the explorer's 4 tools, got %d", len(rec.requests[2].Tools))
+	}
+	// The synth's fallback read was dispatched and fed back as a tool result.
+	synth2 := rec.requests[3].Messages
+	var sawFetch bool
+	for _, m := range synth2 {
+		if m.Role == "tool" && m.ToolCallID == "s1" && strings.Contains(m.Content, "hello there") {
+			sawFetch = true
+		}
+	}
+	if !sawFetch {
+		t.Errorf("synth's fallback read was not dispatched back as a tool result: %+v", synth2)
+	}
+	if !strings.Contains(out.Content, "hello there") {
+		t.Errorf("answer did not reflect the fetched text: %q", out.Content)
+	}
+
+	// Lean persistence: the synth tool exchange is ephemeral; history is
+	// [user, final-answer] only.
+	sess := s.sessions.byID["s1"]
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if len(sess.messages) != 2 {
+		t.Fatalf("session has %d messages, want 2 (lean [user, answer])", len(sess.messages))
+	}
+	for _, m := range sess.messages {
+		if m.Role == "tool" || len(m.ToolCalls) > 0 {
+			t.Errorf("synth tool exchange leaked into durable history: %+v", m)
+		}
+	}
+	if sess.messages[1].Content != "The note says hello there." {
+		t.Errorf("persisted answer = %q, want the synth final answer", sess.messages[1].Content)
 	}
 }
 
@@ -244,16 +320,19 @@ func TestExplorePhase_HitsMaxIterationsAndErrors(t *testing.T) {
 	}
 }
 
-// TestConsult_PersistsToolExchangesInHistory — Amy's explicit design
-// call: session.messages holds [user, assistant(tool_calls), tool, ...,
-// synth-answer]. Next turn's request includes that full history.
-func TestConsult_PersistsToolExchangesInHistory(t *testing.T) {
+// TestConsult_PersistsLeanHistory — with the report hand-off, the session
+// keeps only [user-prompt, synth-answer] per turn. The explorer's tool
+// exchanges and its report are ephemeral: gathered for that turn's synth
+// call, never stored. This replaces the old "persist tool exchanges"
+// model, which only existed because the raw transcript WAS the hand-off;
+// with reports there is nothing to persist.
+func TestConsult_PersistsLeanHistory(t *testing.T) {
 	exp := newSandboxExplorer(t)
 	rec := &recordingClient{
 		responses: []*deepseek.ChatCompletionResponse{
-			// Turn 1 explore: one tool call, then text (stripped).
+			// Turn 1 explore: one tool call, then a report.
 			toolCallResp("read_file", `{"path":"note.txt"}`, "c1"),
-			finalResp("Exploration complete."),
+			finalResp("Loaded note.txt; it says hello there."),
 			// Turn 1 synth: writes the answer.
 			finalResp("file says hello there"),
 			// Turn 2 explore: no tool calls.
@@ -271,13 +350,13 @@ func TestConsult_PersistsToolExchangesInHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// After turn 1, sess.messages = [u1, a1-tool_calls, t1-result, a1-synth] = 4.
-	// Turn 2 explore sees those 4 + u2 = 5.
+	// After turn 1, sess.messages = [u1, synth-answer] = 2 (no tool exchanges,
+	// no report). Turn 2 explore sees those 2 + u2 = 3.
 	turn2Explore := rec.requests[3].Messages
-	if len(turn2Explore) != 5 {
-		t.Fatalf("turn 2 explore messages = %d, want 5 (u1, a-tool, tool, synth, u2)", len(turn2Explore))
+	if len(turn2Explore) != 3 {
+		t.Fatalf("turn 2 explore messages = %d, want 3 (u1, synth-answer, u2)", len(turn2Explore))
 	}
-	wantRoles := []string{"user", "assistant", "tool", "assistant", "user"}
+	wantRoles := []string{"user", "assistant", "user"}
 	for i, want := range wantRoles {
 		if turn2Explore[i].Role != want {
 			gotRoles := make([]string, len(turn2Explore))
@@ -287,7 +366,14 @@ func TestConsult_PersistsToolExchangesInHistory(t *testing.T) {
 			t.Fatalf("turn 2 explore role[%d] = %q, want %q; full: %v", i, turn2Explore[i].Role, want, gotRoles)
 		}
 	}
-	if turn2Explore[2].ToolCallID != "c1" {
-		t.Errorf("tool message tool_call_id = %q, want c1", turn2Explore[2].ToolCallID)
+	// No tool exchanges should ever reach durable history.
+	for _, m := range turn2Explore {
+		if m.Role == "tool" || len(m.ToolCalls) > 0 {
+			t.Errorf("tool exchange leaked into durable history: %+v", m)
+		}
+	}
+	// The persisted assistant turn is the SYNTH answer, not the explorer's report.
+	if turn2Explore[1].Content != "file says hello there" {
+		t.Errorf("persisted assistant = %q, want the synth answer", turn2Explore[1].Content)
 	}
 }

@@ -4,12 +4,18 @@ dpal ships two built-in system prompts, both in `cmd/dpal/prompt.go`:
 
 - **`defaultSystemPrompt`** — sent to the synthesizer in two-phase
   `consult_deepseek`, and to `consult_deepseek_oneshot`. Tuned for
-  V4-Pro with thinking mode on. Carries **no** tool-use prose; the API's
-  `tools` parameter conveys availability when oneshot attaches tools, and
-  the synthesizer phase passes `tools=nil`.
+  V4-Pro with thinking mode on. Carries a short, *conditional* tool-use
+  note: when the explore phase ran, the synth is given the explorer's
+  tools and may `read_file` a span the report pointed to but didn't quote.
+  The note is phrased so it's a no-op for oneshot / `disable_explore`
+  (which run `tools=nil`).
 - **`defaultExplorerSystemPrompt`** — sent to the explorer in two-phase
-  `consult_deepseek`. Tuned for V4-Flash with thinking off. Describes
-  the three sandbox tools and a fixed stopping condition.
+  `consult_deepseek`. Tuned for V4-Flash with thinking **on**. Describes
+  the four sandbox tools and frames the explorer as a *curator*: load the
+  files the answer depends on, then write a `BEGIN/END EXPLORATION` report
+  (condensed tree, verbatim quotes of what matters, an index of what it
+  didn't quote, negative space). That report — not the raw transcript — is
+  the hand-off.
 
 Per-call `system_prompt` / `explorer_system_prompt` overrides win over
 these. CLI flags and config-file prompts compose on top via
@@ -41,6 +47,20 @@ synth call (see `server.go` and `docs/issues.md`): the protocol's
 explicit "don't call tools" knob, which holds regardless of what the
 history or prompt suggest. The prose principle below still stands; it
 just isn't the whole story.
+
+**Correction (later, architecture change — report hand-off):** the leak
+above was driven by feeding the synthesizer the explorer's raw tool-call
+transcript, so it saw a conversation mid-tool-loop and tried to continue
+it. That hand-off is gone: the explorer now writes a *curated report*,
+which is folded into the synth's user prompt as reference text — no
+tool-call history crosses over, so there's nothing mid-loop to continue.
+At the same time the synthesizer is now *deliberately* given the explorer's
+tools (auto `tool_choice`) so it can fetch a span the report didn't quote.
+So `tool_choice:"none"` now applies only to the `disable_explore` / direct
+path (no explorer pass, no tools); when the explore phase ran, the synth
+gets tools on purpose. The principle "don't describe tools for a call that
+won't have them" is intact — the synth prompt's tool note is conditional
+and the call genuinely has tools when the report is present.
 
 ## Principles that emerged
 
