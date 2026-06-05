@@ -23,7 +23,14 @@ import (
 	"github.com/tobert/dpal/internal/explorer"
 )
 
-const defaultMaxToolIterations = 25
+// defaultMaxToolIterations bounds the tool-call loop. DeepSeek's explorer
+// is tool-heavy — it reads one file per round-trip far more often than it
+// batches — so a review across a sizeable repo can legitimately want many
+// dozens of round-trips. The cap exists to stop a runaway loop, not to
+// ration normal exploration; set it high and let the graceful cap-hit
+// (forced tool_choice:"none" on the final iteration) wind the loop down
+// with a report rather than a hard error.
+const defaultMaxToolIterations = 100
 
 // toolChoiceNone is the OpenAI-compatible tool_choice value that forbids
 // the model from calling any tool. dpal sets it on the synthesizer call so
