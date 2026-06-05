@@ -126,8 +126,11 @@ func TestTwoPhase_ExplorerSystemPromptScoped(t *testing.T) {
 	if got := rec.requests[0].Messages[0].Content; got != "EXPLORER-SYS" {
 		t.Errorf("explore-phase system prompt = %q, want EXPLORER-SYS", got)
 	}
-	if got := rec.requests[1].Messages[0].Content; got != "SYNTH-SYS" {
-		t.Errorf("synth-phase system prompt = %q, want SYNTH-SYS", got)
+	// The synth prompt is the configured synth persona (SYNTH-SYS), not the
+	// explorer's — plus the conditional tool note, since the explore phase ran
+	// and the synth carries tools.
+	if got := rec.requests[1].Messages[0].Content; !strings.HasPrefix(got, "SYNTH-SYS") || strings.Contains(got, "EXPLORER-SYS") {
+		t.Errorf("synth-phase system prompt = %q, want it scoped to the SYNTH-SYS persona", got)
 	}
 }
 

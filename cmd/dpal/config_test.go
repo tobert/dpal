@@ -7,6 +7,19 @@ import (
 	"testing"
 )
 
+// The default system prompt must not describe file-exploration tools. It is
+// reused for the disable_explore / oneshot synth call, which runs with no
+// tools — and a prompt that advertises read_file to a tools=nil call primes
+// the raw-tool-call leak (markup lands in content). Tool availability is
+// communicated per-call by the server's conditional note, never the persona.
+func TestDefaultSystemPrompt_DescribesNoTools(t *testing.T) {
+	for _, tool := range []string{"read_file", "read_files", "search_project", "project_tree", "list_directory"} {
+		if strings.Contains(defaultSystemPrompt, tool) {
+			t.Errorf("default system prompt names the tool %q; it must stay tool-free (see the leak post-mortem)", tool)
+		}
+	}
+}
+
 func TestLoadConfig_MissingFileIsNotAnError(t *testing.T) {
 	// No explicit path + a fake home that has no dpal config file.
 	tmp := t.TempDir()

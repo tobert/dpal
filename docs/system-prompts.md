@@ -62,6 +62,22 @@ gets tools on purpose. The principle "don't describe tools for a call that
 won't have them" is intact — the synth prompt's tool note is conditional
 and the call genuinely has tools when the report is present.
 
+**Correction (later — the note was not actually conditional):** the claim
+above said "the synth prompt's tool note is conditional," but it wasn't:
+the *default* persona prompt carried a paragraph naming `read_file` /
+`start_line` / `end_line` unconditionally, and that same persona is reused
+for the `disable_explore` / oneshot synth — a tools=nil call. So the leak
+recurred there: the persona advertised tools the call didn't have, and the
+model emitted tool markup into `content` (tool_choice:"none" suppresses
+*structured* calls but not tool-shaped *text* a primed model writes). The
+fix makes the conditionality real: the persona now names **no** tools, and
+the server appends a one-line tool note (`synthToolNote`) to the synth
+prompt **only when the explore phase ran and the call carries tools**.
+Guarded by `TestDefaultSystemPrompt_DescribesNoTools` (persona stays
+tool-free) and `TestConsult_DirectSynthPromptOmitsToolNote` /
+`TestConsult_ExploreRanSynthPromptHasToolNote` (the note appears iff there
+are tools).
+
 ## Principles that emerged
 
 Preserve these unless a future round of testing falsifies them:

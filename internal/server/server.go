@@ -835,6 +835,15 @@ func (s *Server) Consult(
 	if exp != nil && !in.DisableExplore {
 		synthExp = exp
 		synthToolChoice = ""
+		// The synth call genuinely has tools now, so it's safe — and useful —
+		// to tell the model they exist. The note augments the persona prompt;
+		// with no persona we stay lean (the report's preamble already hints the
+		// tools when a report exists). With no tools at all (disable_explore)
+		// the note is omitted entirely, keeping the prompt from priming a
+		// tool-call leak.
+		if synthSysPrompt != "" {
+			synthSysPrompt += synthToolNote
+		}
 	}
 	synthCtx, synthSpan := s.tracer.Start(ctx, "dpal.synthesize",
 		trace.WithAttributes(attribute.String("gen_ai.request.model", synthModel)))
@@ -907,6 +916,15 @@ const (
 	exploreReportEndMarker   = "END OF EXPLORATION"
 	exploreContextPreamble   = "\n\n---\nThe following context was gathered from the codebase by an exploration assistant to help you answer. It is reference material, not a draft answer: write your own response from it, and cite the file:line locations it points to. If it points to a location it did not quote in full and you need the exact text, read it yourself with read_file (use start_line/end_line for a precise window).\n\n"
 )
+
+// synthToolNote is appended to the synthesizer's system prompt ONLY when
+// that call actually carries the explorer's tools (the explore phase ran).
+// The base persona prompt stays tool-free on purpose: describing tools to a
+// tools=nil call (the disable_explore / oneshot path) primes the raw
+// tool-call leak — the model emits tool markup into content it cannot
+// execute. So tool availability is a per-call fact the server states here,
+// never a standing claim baked into the persona. See docs/system-prompts.md.
+const synthToolNote = "\n\nFile-exploration tools (read_file with start_line/end_line, search_project) are available on this call. The reference context above is meant to be sufficient; reach for a tool only to fetch an exact span it pointed to but did not quote in full."
 
 // extractExplorerReport pulls the explorer's curated report out of the
 // explore-phase transcript and returns how many tool calls the explorer
