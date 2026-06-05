@@ -295,10 +295,111 @@ func TestExplorePhase_OneshotRejectsToolCalls(t *testing.T) {
 	}
 }
 
-// TestExplorePhase_HitsMaxIterationsAndErrors — the explore phase honors
-// the tool-iteration cap and aborts the whole Consult call without ever
-// reaching the synth phase.
-func TestExplorePhase_HitsMaxIterationsAndErrors(t *testing.T) {
+// cappingClient models a WELL-BEHAVED model: it keeps requesting a tool
+// every turn, but the moment the loop forces tool_choice:"none" (the
+// graceful cap-hit) it returns a final text answer instead of more tool
+// calls. This is what lets the loop wind down to a report rather than
+// erroring out and discarding everything the model loaded.
+type cappingClient struct {
+	requests []*deepseek.ChatCompletionRequest
+	final    string // content returned once tools are forbidden
+}
+
+func (c *cappingClient) CreateChatCompletion(_ context.Context, req *deepseek.ChatCompletionRequest) (*deepseek.ChatCompletionResponse, error) {
+	c.requests = append(c.requests, req)
+	if req.ToolChoice == toolChoiceNone {
+		content := c.final
+		if content == "" {
+			content = "report from what I loaded"
+		}
+		return finalResp(content), nil
+	}
+	return toolCallResp("list_directory", `{"path":"."}`, "x"), nil
+}
+
+// TestChat_GracefulStopAtCap — the core of the cap-hit fix. When a model
+// keeps requesting tools, the loop forces tool_choice:"none" on its final
+// permitted turn so the model produces a report from what it loaded,
+// instead of the loop exhausting its budget and erroring (which discarded
+// every file the model had read).
+func TestChat_GracefulStopAtCap(t *testing.T) {
+	exp := newSandboxExplorer(t)
+	c := &cappingClient{final: "forced report"}
+	s := New(c).WithExplorer(exp)
+	s.maxToolIterations = 3
+
+	msgs := []deepseek.ChatCompletionMessage{{Role: deepseek.ChatMessageRoleUser, Content: "explore"}}
+	resp, out, err := s.chat(context.Background(), "m", "sys", exp, msgs, true, "", "")
+	if err != nil {
+		t.Fatalf("cap-hit should wind down to a report, got error: %v", err)
+	}
+	if len(c.requests) != 3 {
+		t.Fatalf("expected exactly maxIter=3 upstream calls, got %d", len(c.requests))
+	}
+	// The final permitted call must forbid tools so the model has to answer.
+	if c.requests[2].ToolChoice != toolChoiceNone {
+		t.Errorf("final call tool_choice = %q, want %q", c.requests[2].ToolChoice, toolChoiceNone)
+	}
+	// Earlier calls must NOT be pinned to none — the model is free to explore.
+	if c.requests[0].ToolChoice == toolChoiceNone {
+		t.Errorf("first call was pinned to none; the model must be free to call tools early")
+	}
+	if resp.Choices[0].Message.Content != "forced report" {
+		t.Errorf("final content = %q, want the forced report", resp.Choices[0].Message.Content)
+	}
+	// The returned history ends on the report (assistant, no tool calls).
+	last := out[len(out)-1]
+	if last.Role != deepseek.ChatMessageRoleAssistant || len(last.ToolCalls) != 0 {
+		t.Errorf("history should end on the report turn, got %+v", last)
+	}
+}
+
+// TestChat_InjectsBudgetNotes — the model is told how much budget remains
+// so it can self-pace, instead of crawling blind until it's cut off. The
+// note rides as a trailing system message (kept off the cached prefix).
+func TestChat_InjectsBudgetNotes(t *testing.T) {
+	exp := newSandboxExplorer(t)
+	c := &cappingClient{}
+	s := New(c).WithExplorer(exp)
+	s.maxToolIterations = 3
+
+	msgs := []deepseek.ChatCompletionMessage{{Role: deepseek.ChatMessageRoleUser, Content: "explore"}}
+	if _, _, err := s.chat(context.Background(), "m", "sys", exp, msgs, true, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// A warning note appears while budget remains (iter 0: 2 calls left).
+	warn := lastSystemNote(c.requests[0])
+	if !strings.Contains(warn, "remain") || strings.Contains(warn, "final turn") {
+		t.Errorf("first call should carry the budget-remaining note, trailing system msg = %q", warn)
+	}
+	// The final call carries the finalize note, not a "remaining" warning.
+	final := lastSystemNote(c.requests[2])
+	if !strings.Contains(final, "final turn") {
+		t.Errorf("final call missing the finalize note, trailing system msg = %q", final)
+	}
+}
+
+// lastSystemNote returns the content of the request's trailing message if
+// it is a system message, else "". The budget note is injected at the tail
+// so it never disturbs the cacheable system+history prefix.
+func lastSystemNote(req *deepseek.ChatCompletionRequest) string {
+	if len(req.Messages) == 0 {
+		return ""
+	}
+	m := req.Messages[len(req.Messages)-1]
+	if m.Role != deepseek.ChatMessageRoleSystem {
+		return ""
+	}
+	return m.Content
+}
+
+// TestExplorePhase_MisbehavingModelStillErrorsAtCap — the graceful cap-hit
+// relies on the model honoring tool_choice:"none". A model that IGNORES it
+// and keeps emitting tool calls right through the final forced turn must
+// still fail loudly rather than loop forever or return corrupt output.
+// (recordingClient ignores tool_choice, so it stands in for that model.)
+func TestExplorePhase_MisbehavingModelStillErrorsAtCap(t *testing.T) {
 	exp := newSandboxExplorer(t)
 	infinite := []*deepseek.ChatCompletionResponse{}
 	for range 20 {
@@ -310,7 +411,7 @@ func TestExplorePhase_HitsMaxIterationsAndErrors(t *testing.T) {
 
 	_, _, err := s.Consult(context.Background(), nil, ConsultInput{SessionID: "s1", Prompt: "loop forever"})
 	if err == nil {
-		t.Fatal("expected error when loop exceeds iteration cap")
+		t.Fatal("expected error when a model ignores forced tool_choice and never stops")
 	}
 	if !strings.Contains(err.Error(), "exceeded") {
 		t.Errorf("error message should mention exceeded iterations, got: %v", err)

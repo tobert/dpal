@@ -39,6 +39,22 @@ const defaultMaxToolIterations = 100
 // tool-call markup into the response content).
 const toolChoiceNone = "none"
 
+// Budget signalling for the tool loop. The model is told how much
+// tool-call budget remains so it can self-pace and curate deliberately,
+// rather than crawling blind until it's cut off mid-read. The note rides
+// as a TRAILING system message (see callAttempt) so it never disturbs the
+// cacheable system-prompt + history prefix.
+//
+// toolBudgetWarnThreshold: start warning when this many calls (or fewer)
+// remain after the current one. toolBudgetFinalNote: sent on the final
+// permitted turn, paired with a forced tool_choice:"none" so the model
+// produces its answer/report from what it has instead of being guillotined.
+const toolBudgetWarnThreshold = 5
+
+const toolBudgetFinalNote = "This is your final turn — tool calls are now disabled. Write your complete response now using only the context you have already loaded. Do not ask for more; ground your answer in what you have."
+
+const toolBudgetWarnNoteFmt = "Budget notice: %d tool call(s) remain before tool use is disabled and you must finalize. Load only what is essential now, then write your response."
+
 // V4 model IDs. deepseek-go v1.3.4 only exposes the legacy DeepSeekChat
 // ("deepseek-chat") and DeepSeekReasoner ("deepseek-reasoner") aliases.
 // Those aliases route to deepseek-v4-flash (non-thinking/thinking
@@ -194,7 +210,25 @@ func (s *Server) chat(
 	}
 
 	for iter := 0; iter < maxIter; iter++ {
-		resp, err := s.callOnce(ctx, model, systemPrompt, msgs, tools, iter, enableThinking, reasoningEffort, toolChoice)
+		// Budget management for the tool loop. Only meaningful when tools are
+		// on offer; a no-tools call always returns text on its own.
+		iterToolChoice := toolChoice
+		budgetNote := ""
+		if len(tools) > 0 {
+			remainingAfter := maxIter - 1 - iter // calls left AFTER this one
+			switch {
+			case remainingAfter <= 0:
+				// Final permitted call: forbid tools so the model produces its
+				// report/answer from what it loaded instead of being cut off
+				// mid-crawl with all that loading discarded (the old hard error).
+				iterToolChoice = toolChoiceNone
+				budgetNote = toolBudgetFinalNote
+			case remainingAfter <= toolBudgetWarnThreshold:
+				budgetNote = fmt.Sprintf(toolBudgetWarnNoteFmt, remainingAfter)
+			}
+		}
+
+		resp, err := s.callOnce(ctx, model, systemPrompt, msgs, tools, iter, enableThinking, reasoningEffort, iterToolChoice, budgetNote)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -259,6 +293,7 @@ func (s *Server) callOnce(
 	enableThinking bool,
 	reasoningEffort string,
 	toolChoice string,
+	budgetNote string,
 ) (*deepseek.ChatCompletionResponse, error) {
 	var lastErr error
 	for attempt := 0; attempt <= s.retryMax; attempt++ {
@@ -270,7 +305,7 @@ func (s *Server) callOnce(
 				return nil, ctx.Err()
 			}
 		}
-		resp, err := s.callAttempt(ctx, model, systemPrompt, messages, tools, iter, attempt, enableThinking, reasoningEffort, toolChoice)
+		resp, err := s.callAttempt(ctx, model, systemPrompt, messages, tools, iter, attempt, enableThinking, reasoningEffort, toolChoice, budgetNote)
 		if err == nil {
 			return resp, nil
 		}
@@ -320,15 +355,27 @@ func (s *Server) callAttempt(
 	enableThinking bool,
 	reasoningEffort string,
 	toolChoice string,
+	budgetNote string,
 ) (*deepseek.ChatCompletionResponse, error) {
+	// The system prompt is the cacheable PREFIX; the budget note is a
+	// transient TAIL. Keeping them on opposite ends means the per-turn note
+	// never busts the prompt-cache prefix the explorer/synth rely on.
 	outbound := messages
-	if systemPrompt != "" {
-		outbound = make([]deepseek.ChatCompletionMessage, 0, len(messages)+1)
-		outbound = append(outbound, deepseek.ChatCompletionMessage{
-			Role:    deepseek.ChatMessageRoleSystem,
-			Content: systemPrompt,
-		})
+	if systemPrompt != "" || budgetNote != "" {
+		outbound = make([]deepseek.ChatCompletionMessage, 0, len(messages)+2)
+		if systemPrompt != "" {
+			outbound = append(outbound, deepseek.ChatCompletionMessage{
+				Role:    deepseek.ChatMessageRoleSystem,
+				Content: systemPrompt,
+			})
+		}
 		outbound = append(outbound, messages...)
+		if budgetNote != "" {
+			outbound = append(outbound, deepseek.ChatCompletionMessage{
+				Role:    deepseek.ChatMessageRoleSystem,
+				Content: budgetNote,
+			})
+		}
 	}
 
 	ctx, span := s.tracer.Start(ctx, "deepseek.chat",
@@ -350,6 +397,9 @@ func (s *Server) callAttempt(
 	}
 	if toolChoice != "" {
 		span.SetAttributes(attribute.String("dpal.tool_choice", toolChoice))
+	}
+	if budgetNote != "" {
+		span.SetAttributes(attribute.Bool("dpal.tool_budget_note", true))
 	}
 
 	req := &deepseek.ChatCompletionRequest{
