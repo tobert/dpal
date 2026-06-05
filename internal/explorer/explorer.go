@@ -28,6 +28,7 @@ const (
 	defaultMaxSearchBytes int64 = 512 * 1024 // skip files larger than this in search
 	defaultMaxTreeEntries       = 2000       // cap on project_tree lines
 	defaultMaxTreeBytes   int64 = 64 * 1024  // cap on project_tree output size
+	defaultMaxBatchFiles        = 30         // cap on files per read_files call
 )
 
 // defaultTreeSkipDirs are directory names project_tree always prunes,
@@ -56,6 +57,7 @@ type Explorer struct {
 	maxSearchBytes int64
 	maxTreeEntries int
 	maxTreeBytes   int64
+	maxBatchFiles  int
 }
 
 // New constructs an Explorer rooted at root. The path is made absolute
@@ -87,6 +89,7 @@ func New(root string) (*Explorer, error) {
 		maxSearchBytes: defaultMaxSearchBytes,
 		maxTreeEntries: defaultMaxTreeEntries,
 		maxTreeBytes:   defaultMaxTreeBytes,
+		maxBatchFiles:  defaultMaxBatchFiles,
 	}, nil
 }
 
@@ -200,6 +203,41 @@ func (e *Explorer) ReadFile(path string) (string, error) {
 	b.WriteString(numberLines(data))
 	if int64(len(data)) < info.Size() {
 		fmt.Fprintf(&b, "--- (truncated; first %d of %d bytes shown)\n", len(data), info.Size())
+	}
+	return b.String(), nil
+}
+
+// ReadFiles reads several files in a single tool call and concatenates
+// their blocks in request order. The tool-iteration cap counts round-trips,
+// not files, so loading a working set this way (a diff's touched files plus
+// the helpers they call) stretches the budget far further than one read_file
+// per turn — the loading pattern DeepSeek's explorer otherwise defaults to.
+//
+// Each file is read from the top under the same head byte cap as ReadFile.
+// A path that fails to read (missing, a directory, a sandbox escape) is
+// reported INLINE as its own error block and the rest still load: a single
+// bad path in a batch the model meant as a unit should not sink the whole
+// call. The error is surfaced in the returned text, not swallowed — the
+// model sees exactly which path failed and why.
+func (e *Explorer) ReadFiles(paths []string) (string, error) {
+	if len(paths) == 0 {
+		return "", fmt.Errorf("read_files: no paths given")
+	}
+	if len(paths) > e.maxBatchFiles {
+		return "", fmt.Errorf("read_files: %d paths exceeds the %d-file batch limit; split into multiple calls", len(paths), e.maxBatchFiles)
+	}
+	var b strings.Builder
+	for i, p := range paths {
+		if i > 0 {
+			b.WriteByte('\n') // blank line between blocks
+		}
+		out, err := e.ReadFile(p)
+		if err != nil {
+			// Mirror ReadFile's header shape so the block is self-describing.
+			fmt.Fprintf(&b, "file %s\n---\nerror: %v\n", p, err)
+			continue
+		}
+		b.WriteString(out)
 	}
 	return b.String(), nil
 }
@@ -564,6 +602,24 @@ func (e *Explorer) ToolDefinitions() []deepseek.Tool {
 		{
 			Type: "function",
 			Function: deepseek.Function{
+				Name:        "read_files",
+				Description: "Read SEVERAL files in one call — much cheaper than one read_file per turn, because the tool-call budget is counted in round-trips, not files. Reach for this to pull a whole working set at once (a diff's touched files plus the helpers they call). Each file is read from the top under the same size cap as read_file; for a precise deep window in a single file, use read_file with start_line/end_line instead. A path that can't be read is reported inline and the remaining files still load.",
+				Parameters: &deepseek.FunctionParameters{
+					Type: "object",
+					Properties: map[string]any{
+						"paths": map[string]any{
+							"type":        "array",
+							"items":       map[string]any{"type": "string"},
+							"description": "File paths, each relative to the project root, to read in one batch.",
+						},
+					},
+					Required: []string{"paths"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: deepseek.Function{
 				Name:        "search_project",
 				Description: "Search for lines matching a Go regexp across files under the project root. Returns matches grouped by file with line numbers. Skips dependency/build dirs (.git, node_modules, vendor, target, __pycache__, etc.).",
 				Parameters: &deepseek.FunctionParameters{
@@ -632,6 +688,18 @@ func (e *Explorer) Dispatch(name string, argsJSON string) string {
 		} else {
 			out, err = e.ReadFile(args.Path)
 		}
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		return out
+	case "read_files":
+		var args struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return fmt.Sprintf("error: invalid arguments for read_files: %v", err)
+		}
+		out, err := e.ReadFiles(args.Paths)
 		if err != nil {
 			return "error: " + err.Error()
 		}

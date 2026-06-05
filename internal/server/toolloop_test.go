@@ -152,11 +152,11 @@ func TestExplorePhase_SynthGetsToolsWhenExploreRan(t *testing.T) {
 	if len(rec.requests) != 2 {
 		t.Fatalf("expected 2 upstream calls, got %d", len(rec.requests))
 	}
-	if len(rec.requests[0].Tools) != 4 {
-		t.Errorf("explore phase Tools = %d, want 4", len(rec.requests[0].Tools))
+	if len(rec.requests[0].Tools) != 5 {
+		t.Errorf("explore phase Tools = %d, want 5", len(rec.requests[0].Tools))
 	}
-	if len(rec.requests[1].Tools) != 4 {
-		t.Errorf("synth phase Tools = %d, want 4 (synth may fetch beyond the report)", len(rec.requests[1].Tools))
+	if len(rec.requests[1].Tools) != 5 {
+		t.Errorf("synth phase Tools = %d, want 5 (synth may fetch beyond the report)", len(rec.requests[1].Tools))
 	}
 }
 
@@ -189,8 +189,8 @@ func TestConsult_SynthCanFetchBeyondReport(t *testing.T) {
 	if len(rec.requests) != 4 {
 		t.Fatalf("expected 4 upstream calls, got %d", len(rec.requests))
 	}
-	if len(rec.requests[2].Tools) != 4 {
-		t.Errorf("synth phase should advertise the explorer's 4 tools, got %d", len(rec.requests[2].Tools))
+	if len(rec.requests[2].Tools) != 5 {
+		t.Errorf("synth phase should advertise the explorer's 5 tools, got %d", len(rec.requests[2].Tools))
 	}
 	// The synth's fallback read was dispatched and fed back as a tool result.
 	synth2 := rec.requests[3].Messages

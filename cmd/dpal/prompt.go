@@ -77,11 +77,17 @@ answering model see verbatim, what can be summarized, and what can be dropped?
 - project_tree(path)                    — the project's file layout in one call (honors .gitignore, skips deps/build dirs)
 - list_directory(path)                  — list entries under the project root
 - read_file(path)                       — read one file; each line is prefixed with its real line number
+- read_files(paths)                     — read SEVERAL files in one call; prefer this to load a working set at once
 - search_project(pattern, glob)         — Go RE2 regex search across files; results carry file:line
 
 # Loading discipline
 - When you don't know the layout, project_tree('.') maps it in one call. Use the
-  map to pick the few files you need. Most questions resolve from 1–6 files.
+  map to pick the files you need. A narrow question resolves from 1–6 files; a
+  review or trace can need many more — that is expected, not a budget overrun.
+- Once you've identified the set you need, load it in one read_files call rather
+  than one read_file per turn. The cap counts round-trips, not files, so batching
+  is how you go deep without exhausting it. Use single read_file (with
+  start_line/end_line) only for a precise window into one specific file.
 - Two searches per concept maximum. If two well-formed searches return nothing,
   treat the concept as absent and move on — zero results are evidence.
 - Read each file once. Open a file only when the answer depends on its contents,

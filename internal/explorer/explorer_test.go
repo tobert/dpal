@@ -138,6 +138,88 @@ func TestReadFile_ReturnsContents(t *testing.T) {
 	}
 }
 
+func TestReadFiles_ReadsBatchInOrder(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "a.txt", "alpha")
+	writeFile(t, dir, "b.txt", "bravo")
+
+	out, err := exp.ReadFiles([]string{"a.txt", "b.txt"})
+	if err != nil {
+		t.Fatalf("ReadFiles: %v", err)
+	}
+	for _, want := range []string{"a.txt", "alpha", "b.txt", "bravo"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("batch output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Index(out, "alpha") > strings.Index(out, "bravo") {
+		t.Errorf("files not concatenated in request order:\n%s", out)
+	}
+}
+
+func TestReadFiles_PerFileErrorInlineDoesNotSinkBatch(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "good.txt", "present")
+
+	// One readable path, one missing path: the good file must still load and
+	// the bad one is reported inline rather than failing the whole call.
+	out, err := exp.ReadFiles([]string{"good.txt", "missing.txt"})
+	if err != nil {
+		t.Fatalf("a missing path should not fail the batch: %v", err)
+	}
+	if !strings.Contains(out, "present") {
+		t.Errorf("good file dropped when a sibling errored:\n%s", out)
+	}
+	if !strings.Contains(out, "missing.txt") || !strings.Contains(out, "error") {
+		t.Errorf("missing path not reported inline:\n%s", out)
+	}
+}
+
+func TestReadFiles_RejectsEmpty(t *testing.T) {
+	exp, _ := newTestExplorer(t)
+	if _, err := exp.ReadFiles(nil); err == nil {
+		t.Error("expected error for empty path list")
+	}
+}
+
+func TestReadFiles_RejectsOverBatchLimit(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	exp.maxBatchFiles = 2
+	writeFile(t, dir, "a.txt", "a")
+	writeFile(t, dir, "b.txt", "b")
+	writeFile(t, dir, "c.txt", "c")
+	if _, err := exp.ReadFiles([]string{"a.txt", "b.txt", "c.txt"}); err == nil {
+		t.Error("expected error when batch exceeds the file limit")
+	}
+}
+
+func TestReadFiles_RejectsEscape(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "ok.txt", "fine")
+	// An escaping path is a sandbox violation, surfaced inline like any other
+	// per-file read error — the in-sandbox file still loads.
+	out, err := exp.ReadFiles([]string{"ok.txt", "../../../etc/passwd"})
+	if err != nil {
+		t.Fatalf("ReadFiles: %v", err)
+	}
+	if !strings.Contains(out, "fine") {
+		t.Errorf("in-sandbox file dropped:\n%s", out)
+	}
+	if !strings.Contains(out, "error") {
+		t.Errorf("escape attempt not reported as an error:\n%s", out)
+	}
+}
+
+func TestDispatch_ReadFiles(t *testing.T) {
+	exp, dir := newTestExplorer(t)
+	writeFile(t, dir, "a.txt", "alpha")
+	writeFile(t, dir, "b.txt", "bravo")
+	out := exp.Dispatch("read_files", `{"paths":["a.txt","b.txt"]}`)
+	if !strings.Contains(out, "alpha") || !strings.Contains(out, "bravo") {
+		t.Errorf("Dispatch read_files did not return both files:\n%s", out)
+	}
+}
+
 func TestReadFile_TruncatesLargeFile(t *testing.T) {
 	exp, dir := newTestExplorer(t)
 	exp.maxFileBytes = 10
@@ -466,7 +548,7 @@ func TestDispatch_UnknownToolErrors(t *testing.T) {
 func TestToolDefinitions_CoversAllTools(t *testing.T) {
 	exp, _ := newTestExplorer(t)
 	defs := exp.ToolDefinitions()
-	want := map[string]bool{"list_directory": false, "read_file": false, "search_project": false, "project_tree": false}
+	want := map[string]bool{"list_directory": false, "read_file": false, "read_files": false, "search_project": false, "project_tree": false}
 	for _, d := range defs {
 		if d.Type != "function" {
 			t.Errorf("tool type = %q, want %q", d.Type, "function")
