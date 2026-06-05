@@ -58,7 +58,7 @@ concrete. When an item ships, delete the entry.
   fetch is a `deepseek-v4-pro` tool iteration — expensive. Fine as a
   safety net; watch the counts. If pro over-fetches, tighten the synth
   system-prompt nudge or give the synth tool loop its own (smaller)
-  iteration cap separate from the explorer's 25.
+  iteration cap separate from the explorer's 100.
 
 ## Productivity / DX
 
@@ -103,7 +103,13 @@ concrete. When an item ships, delete the entry.
   just the tool_choice change") read 6 files (project_tree -> 4 targeted
   search_project -> 6 reads) vs 19 for the broad one — thinking lets it
   scale effort to scope, which the non-thinking explorer couldn't.
-  Still open: (b) code-side repeat-detection (skip duplicate tool calls).
+  Since then: cap 25->100 (it's a runaway backstop, not a ration); the
+  cap-hit now winds down to a report (forced tool_choice:"none" + a
+  per-turn budget note) instead of erroring and discarding the load; and a
+  `read_files` batch tool so a working set loads in one round-trip rather
+  than one read per turn. Still open: (b) code-side repeat-detection (skip
+  duplicate tool calls) — `read_files` reduces the round-trip pressure that
+  motivated it but doesn't dedupe.
 
 - **OTel not on by default for the install command.** README's
   `claude mcp add` example doesn't pass `--otel-endpoint`. When the
