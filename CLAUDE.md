@@ -24,3 +24,11 @@ If a feature is provider-specific, dpal's job is to pass it through, not hide it
 - **Sessions persist lean `[user-prompt, synth-answer]` pairs.** The exploration report and any synth-phase tool fetches are ephemeral context for that turn's synth call only — they are never stored. Each turn re-explores fresh, so old reports would just be stale bloat. (This replaced the earlier "persist the tool exchanges" model, which only existed because the raw transcript *was* the hand-off.)
 - **Working notes — delegate side quests, keep the narrative.** **`docs/issues.md`** is the live work tracker — skim it before proposing new work; record out-of-scope side quests here before moving on, and **delete entries when they ship** rather than marking them done. `docs/devlog.md` is a durable narrative from the agent's perspective. Write your story there.
 - **e2e tests are opt-in:** `DEEPSEEK_API_KEY=... go test -tags=e2e ./internal/server/`. Plain `go test ./...` stays offline.
+
+## Commit style
+
+Commits explain **why, not what** — the diff already shows what changed. Write the body as a short summary of the decisions behind the change, **drawn from the working conversation with the user**: what we chose, what we rejected, and why. A few sentences of reasoning beat a list of files.
+
+- **Subject:** imperative — the decision or outcome, not "update X".
+- **Body:** the reasoning and tradeoffs; cite a decision's source when it matters.
+- Set a `Co-Authored-By:` trailer crediting the model that did the work.
