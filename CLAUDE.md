@@ -28,5 +28,3 @@ If a feature is provider-specific, dpal's job is to pass it through, not hide it
 ## Commit style
 
 Commit and pull request bodies should usually summarize the decisions behind the change, **drawn from the conversation with the user**. Commit messages briefly explain what happened as context for the more important task of explaining the decisions we made.
-
-Set a `Co-Authored-By:` trailer crediting the model that did the work.
